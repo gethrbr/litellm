@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 indexmap = "2.14.0"
 litellm-callbacks.workspace = true
 serde.workspace = true

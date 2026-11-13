@@ -3712,6 +3712,7 @@ dependencies = [
 name = "litellm-callbacks-prometheus"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "indexmap 2.14.0",
  "litellm-callbacks",
  "rstest",
@@ -4441,6 +4442,7 @@ dependencies = [
  "litellm-cache-response",
  "litellm-callbacks-legacy-python",
  "litellm-callbacks-prometheus",
+ "litellm-callbacks-python",
  "litellm-circuit-breaker",
  "litellm-core-utils",
  "litellm-error",

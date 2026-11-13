@@ -1,3 +1,4 @@
+mod callback;
 mod emit;
 mod failure;
 pub mod labels;
@@ -12,20 +13,31 @@ use std::cell::RefCell;
 use litellm_callbacks::CallbackError;
 use serde_json::Value;
 
+pub use crate::{
+    callback::{Attempt, Event, LogSink, Prometheus, Stop, StopKind},
+    store::{Clock, FamilySpec, Kind, ManualClock, Op, Store, StoreError, SystemClock, Target},
+    success::{AttemptFacts, Level, LogLine, exception_text},
+    tracker::SeriesLimits,
+};
 use crate::{
     emit::Emitter,
     failure::Failure,
     success::{Success, SuccessStep},
 };
-pub use crate::{
-    store::{Clock, FamilySpec, Kind, ManualClock, Op, Store, StoreError, SystemClock, Target},
-    success::{AttemptFacts, Level, LogLine, exception_text},
-    tracker::SeriesLimits,
-};
 
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantArray,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Step {
     #[strum(serialize = "success_head")]
     SuccessHead,

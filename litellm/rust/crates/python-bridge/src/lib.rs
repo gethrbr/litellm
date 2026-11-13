@@ -48,9 +48,7 @@ mod _native {
     #[pymodule_export]
     use crate::model_registry::bundled_model_cost_map;
     #[pymodule_export]
-    use crate::prometheus::{
-        NativePrometheusAttempt, NativePrometheusMetric, NativePrometheusStore,
-    };
+    use crate::prometheus::{NativePrometheusMetric, NativePrometheusStore};
     #[pymodule_export]
     use crate::redis::breaker::{NativeAdmission, NativeRedisBreaker, native_redis_breaker_states};
     #[pymodule_export]
@@ -201,7 +199,6 @@ mod tests {
                 "unsupported_tls_settings",
                 "NativePrometheusStore",
                 "NativePrometheusMetric",
-                "NativePrometheusAttempt",
             ];
             #[cfg(feature = "huggingface")]
             expected.push("HuggingFaceEncoding");

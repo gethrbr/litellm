@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use litellm_callbacks_prometheus::{
-    AttemptFacts, FamilySpec, Kind, ManualClock, Op, SeriesLimits, Step, Store, StoreError,
-    SystemClock, Target,
+    FamilySpec, Kind, LogLine, LogSink, ManualClock, Op, Prometheus, SeriesLimits, Store,
+    StoreError, SystemClock, Target,
     ops::{self, ErrorKind, OpError},
-    record,
     store::{Clock, FamilyId},
 };
+use litellm_callbacks_python::NativeCallback;
 use pyo3::{
-    exceptions::{PyBaseException, PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
+    exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyDict, PyFloat, PyTuple},
 };
@@ -155,48 +155,24 @@ impl NativePrometheusStore {
         ops::apply(&self.store, name, facts).map_err(op_error)
     }
 
-    fn attempt(&self, facts: &str) -> PyResult<NativePrometheusAttempt> {
-        let facts: AttemptFacts = serde_json::from_str(facts)
-            .map_err(|error| PyValueError::new_err(format!("prometheus attempt facts: {error}")))?;
-        Ok(NativePrometheusAttempt {
-            store: Arc::clone(&self.store),
-            facts,
-        })
+    fn callback(&self, log: Py<PyAny>) -> PyResult<NativeCallback> {
+        Ok(NativeCallback::new(Arc::new(Prometheus::new(
+            Arc::clone(&self.store),
+            Arc::new(PythonLog(log)),
+        )))?)
     }
 }
 
-type LoggedLine = (&'static str, &'static str, Vec<String>);
+struct PythonLog(Py<PyAny>);
 
-#[pyclass(frozen, name = "NativePrometheusAttempt")]
-pub struct NativePrometheusAttempt {
-    store: Arc<Store>,
-    facts: AttemptFacts,
-}
-
-#[pymethods]
-impl NativePrometheusAttempt {
-    #[pyo3(signature = (step, input_sequence_length=None))]
-    fn record(
-        &self,
-        py: Python<'_>,
-        step: &str,
-        input_sequence_length: Option<String>,
-    ) -> PyResult<(Vec<LoggedLine>, Option<Py<PyBaseException>>)> {
-        let step: Step = step
-            .parse()
-            .map_err(|_| PyValueError::new_err(format!("unknown prometheus step {step}")))?;
-        let recorded = record(&self.store, &self.facts, step, input_sequence_length);
-        Ok((
-            recorded
-                .logs
-                .into_iter()
-                .map(|line| (line.level.into(), line.format, line.args))
-                .collect(),
-            recorded
-                .outcome
-                .err()
-                .map(|error| op_error(OpError::from(error)).into_value(py)),
-        ))
+impl LogSink for PythonLog {
+    fn log(&self, line: &LogLine) {
+        Python::attach(|py| {
+            let level: &'static str = line.level.into();
+            if let Err(error) = self.0.call1(py, (level, line.format, line.args.clone())) {
+                error.write_unraisable(py, None);
+            }
+        });
     }
 }
 
