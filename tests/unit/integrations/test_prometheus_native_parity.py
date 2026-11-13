@@ -786,6 +786,7 @@ _SCENARIOS: Final[Mapping[str, Mapping[str, object]]] = {
     "stream": {"mock_response": "hi there", "stream": True},
     "failure": {"mock_response": "litellm.RateLimitError"},
     "callback_error": {"mock_response": "hi there", "queue_time_seconds": "slow"},
+    "no_log": {"mock_response": "hi there", "no-log": True},
 }
 
 
@@ -870,6 +871,10 @@ async def test_every_registration_path_emits_each_request_exactly_once_as_python
 
     assert any(isinstance(collector, NativeFamilyCollector) for collector in _logger_collectors())
     assert native_text == python_text
+    if scenario == "no_log":
+        assert native_recordings == []
+        assert "litellm_total_tokens_metric_total{" not in native_text
+        return
     expected_event: Final = "failure" if scenario == "failure" else "success"
     assert native_recordings == ([expected_event] if _REGISTRATIONS[registration][1] == "native" else [])
     if (registration, scenario) in _PYTHON_EMITS_NOTHING:
