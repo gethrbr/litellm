@@ -88,6 +88,7 @@ class Request:
     logged: Mapping[str, object] = field(default_factory=dict)
     logged_metadata: Mapping[str, object] = field(default_factory=dict)
     ceiling_raises_at_end: bool = False
+    ended_offset: timedelta | None = None
 
 
 @dataclass
@@ -374,7 +375,10 @@ async def _ended(
                 side.logged_payloads[index] = copy.deepcopy(kwargs["standard_logging_object"])
             if side.dynamic is not None:
                 await side.dynamic.async_log_success_event(kwargs, response, None, None)
-            await side.limiter.async_log_success_event(kwargs, response, None, None)
+            ended_at = (
+                None if request.ended_offset is None else side.limiter._get_current_time() + request.ended_offset  # pyright: ignore[reportPrivateUsage]  # the limiter's clock
+            )
+            await side.limiter.async_log_success_event(kwargs, response, None, ended_at)
         case "log_success":
             await side.limiter.async_logging_hook(kwargs, response, request.call_type)
             await side.limiter.async_log_success_event(kwargs, response, None, None)
@@ -1637,3 +1641,100 @@ async def test_a_handed_over_batch_keeps_its_daily_token_refunds_like_python(
         refunds.append(stash.batch_tpd_refund_ops)
     assert refunds[0] == refunds[1]
     assert refunds[0] != ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setting", "refused"), (("yes", True), (True, True), (1, True), ("maybe", False), (None, False))
+)
+async def test_fail_closed_refuses_with_503_when_redis_is_down_like_python(
+    setting: object, refused: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {"fail_closed_rate_limit_enforcement": setting})
+    clock: Final = Clock()
+    dead: Final = _free_port()
+    request: Final = Request(_auth(rpm_limit=5, tpm_limit=4000), {**_CHAT, "max_tokens": 20})
+    outcomes: Final = [
+        await _run(side, 0, _admit, request)
+        for side in (_side(clock, native=False, port=dead), _side(clock, native=True, port=dead))
+    ]
+    assert outcomes[0] == outcomes[1]
+    assert (outcomes[0] is not None and outcomes[0][:2] == ("RateLimitUnverifiableError", 503)) == refused, outcomes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouping", (True, "true", False))
+async def test_forced_hash_tag_grouping_is_read_like_python(
+    grouping: object, backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "force_redis_hash_tag_grouping", grouping)
+    auth: Final = _auth(rpm_limit=3, tpm_limit=4000, user_id="u1", user_rpm_limit=2, team_id="t1", team_rpm_limit=4)
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 20}) for _ in range(4)],
+        [("api_key", _KEY), ("user", "u1"), ("team", "t1")],
+        backend,
+    )
+    assert observed[3] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_rate_limit_type", ("input", "output", "total", "both"))
+async def test_a_failed_call_charges_the_configured_token_type_like_python(
+    token_rate_limit_type: str, backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {"token_rate_limit_type": token_rate_limit_type})
+    usage: Final = Usage(prompt_tokens=30, completion_tokens=20, total_tokens=50)
+    observed: Final = await _differential(
+        [
+            Request(
+                _auth(tpm_limit=120), {**_CHAT, "max_tokens": 5, "combined_usage_object": usage}, end="proxy_failure"
+            )
+            for _ in range(4)
+        ],
+        [("api_key", _KEY)],
+        backend,
+    )
+    assert observed[0] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ("background_eval", "autorouter_compaction", None))
+async def test_internal_calls_are_exempt_from_token_charges_like_python(
+    origin: str | None, backend: tuple[int | None, int | None]
+) -> None:
+    logged: Final = {"litellm_params": {"metadata": {"model_group": "gpt-4o", "internal_call_origin": origin}}}
+    observed: Final = await _differential(
+        [Request(_auth(tpm_limit=100), {**_CHAT, "max_tokens": 5}, logged=logged) for _ in range(5)],
+        [("api_key", _KEY)],
+        backend,
+    )
+    assert observed[0] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_offset", (timedelta(seconds=-1), timedelta(0), timedelta(seconds=1), None))
+async def test_a_round_ended_before_the_slot_was_reused_keeps_the_slot_like_python(
+    ended_offset: timedelta | None, backend: tuple[int | None, int | None]
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    auth: Final = _auth(max_parallel_requests=1, rpm_limit=10, tpm_limit=3000)
+    outer: Final = Request(auth, {**_CHAT, "max_tokens": 20}, ended_offset=ended_offset)
+    tool: Final = Request(auth, _CHAT, call_type="call_mcp_tool", nested=True)
+    later: Final = Request(auth, {**_CHAT, "max_tokens": 20})
+    scopes: Final = [("api_key", _KEY)]
+    for side in sides:
+        context = contextvars.copy_context()
+        side.contexts[0] = context
+        side.contexts[1] = context
+    admitted: Final = [await _run(side, 0, _admit, outer) for side in sides]
+    assert admitted == [None, None]
+    clock.advance(2)
+    reused: Final = [await _run(side, 1, _admit, tool) for side in sides]
+    assert reused[0] == reused[1]
+    ended: Final = [await _run(side, 0, _end, outer) for side in sides]
+    assert ended[0] == ended[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+    probed: Final = [await _run(side, 2, _admit, later) for side in sides]
+    assert probed[0] == probed[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
