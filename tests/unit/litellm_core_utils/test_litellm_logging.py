@@ -43,8 +43,14 @@ from litellm.cost_calculator import ocr_batch_cost
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2 import Abort, CallContext, CustomLoggerV2, Field, Hook, OptOutBy, Patch, on
 from litellm.integrations.custom_logger_v2.host import V2Outcome, get_dispatcher
+from litellm.integrations.custom_logger_v2.call import CallFacts
 from litellm.integrations.custom_logger_v2.offpath import InProcessSink
 from litellm.integrations.custom_logger_v2.selection import RequestSelection, Selection
+from litellm.types.integrations.custom_logger_v2 import LoggedKeyIdentity as V2LoggedKeyIdentity
+from litellm.types.integrations.custom_logger_v2 import MetadataKind as V2MetadataKind
+from litellm.types.integrations.custom_logger_v2 import Outcome as V2RecordOutcome
+from litellm.types.integrations.custom_logger_v2 import Usage as V2Usage
+from litellm.types.integrations.custom_logger_v2 import UsageRecord as V2UsageRecord
 from litellm.litellm_core_utils import litellm_logging
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
 from litellm.litellm_core_utils.token_counter import token_counter
@@ -15617,6 +15623,98 @@ async def test_a_v2_callback_in_litellm_callbacks_gets_attempt_ended_after_an_ac
         "legacy",
         "v2",
     ]
+
+
+class _AttemptReader(CustomLoggerV2):
+    def __init__(self) -> None:
+        self.seen: list[tuple[CallFacts | None, object, object, object, object]] = []
+        self.done = threading.Event()
+
+    @on(
+        Hook.attempt_ended,
+        reads={Field.outcome, Field.usage, Field.log_id, Field.standard_logging_payload_ref},
+        awaited=True,
+    )
+    async def attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
+        self.seen.append(
+            (
+                ctx.call,
+                getattr(view, "outcome", None),
+                getattr(view, "usage", None),
+                getattr(view, "log_id", None),
+                getattr(view, "standard_logging_payload_ref", None),
+            )
+        )
+        self.done.set()
+
+
+async def test_an_unscoped_acompletion_hands_attempt_ended_call_facts_and_derived_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader: Final = _AttemptReader()
+    _plane_lists(monkeypatch)
+    monkeypatch.setattr(litellm, "callbacks", [reader])
+
+    response: Final = await litellm.acompletion(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], mock_response="ok"
+    )
+
+    assert await asyncio.to_thread(reader.done.wait, 30)
+    call, outcome, usage, log_id, payload = reader.seen[0]
+    assert isinstance(call, CallFacts)
+    assert call.target.model == "gpt-4o"
+    assert call.target.provider == "openai"
+    assert call.kind.synchronous is False
+    assert call.timing.end is not None and call.timing.end >= call.timing.start
+    assert outcome is V2RecordOutcome.success
+    assert isinstance(usage, V2Usage)
+    assert usage.response == V2UsageRecord(
+        prompt_tokens=response.usage.prompt_tokens,
+        completion_tokens=response.usage.completion_tokens,
+        total_tokens=response.usage.total_tokens,
+    )
+    assert isinstance(payload, dict)
+    assert log_id == payload["id"] == response.id
+    assert payload["model"] == "gpt-4o"
+
+
+class _IdentityReader(CustomLoggerV2):
+    def __init__(self) -> None:
+        self.seen: list[tuple[object, object]] = []
+        self.done = threading.Event()
+
+    @on(Hook.attempt_ended, reads={Field.logged_key_identity, Field.key_identity}, awaited=True)
+    async def attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
+        self.seen.append((getattr(view, "logged_key_identity", None), getattr(view, "key_identity", None)))
+        self.done.set()
+
+
+async def test_an_sdk_call_hands_attempt_ended_the_key_identity_its_logged_metadata_carries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader: Final = _IdentityReader()
+    _plane_lists(monkeypatch)
+    monkeypatch.setattr(litellm, "callbacks", [reader])
+
+    _ = await litellm.acompletion(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        mock_response="ok",
+        user="end-user-body",
+        metadata={"user_api_key_team_id": 7, "user_api_key_alias": "sdk-key", "user_api_key_end_user_id": "eu-1"},
+    )
+
+    assert await asyncio.to_thread(reader.done.wait, 30)
+    logged, request_time = reader.seen[0]
+    assert logged == V2LoggedKeyIdentity(
+        metadata_kind=V2MetadataKind.mapping,
+        team_id=7,
+        key_alias="sdk-key",
+        end_user_id="eu-1",
+        request_user="end-user-body",
+        cost_tracking_end_user_id="eu-1",
+    )
+    assert request_time is None
 
 
 class _BrokenStamp(CustomLoggerV2):

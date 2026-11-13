@@ -4,13 +4,16 @@ use futures_util::FutureExt;
 use litellm_callbacks::{
     CallFacts, Callback, Field, FieldValues, Hook, HookInput, ManifestError, RequestState,
 };
-use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
+use litellm_host_python::{from_py, json_from_py, json_to_py, run_async_value};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
     types::PyDict,
 };
 use serde_json::Value;
+
+pub mod payload;
+mod pyjson;
 
 #[pyclass(frozen, name = "NativeCallback")]
 pub struct NativeCallback {
@@ -45,6 +48,18 @@ impl NativeCallback {
 
     pub fn callback(&self) -> &Arc<dyn Callback> {
         &self.callback
+    }
+}
+
+struct Jsonized(Value);
+
+impl<'py> IntoPyObject<'py> for Jsonized {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        json_to_py(py, &self.0)
     }
 }
 
@@ -87,14 +102,21 @@ impl NativeCallback {
         state: Option<PyRef<'py, NativeRequestState>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let input = contained(|| self.input(hook, fields, call, state))?;
+        let render_loop = matches!(input.fields.payload(), Ok(Some(_)))
+            .then(|| payload::running_loop(py))
+            .flatten();
         let callback = Arc::clone(&self.callback);
         run_async_value(py, async move {
-            let handled = AssertUnwindSafe(async move { callback.handle(&input).await })
-                .catch_unwind()
-                .await
-                .map_err(panic_error)?;
+            let handled = payload::on_render_loop(
+                render_loop,
+                AssertUnwindSafe(async move { callback.handle(&input).await }).catch_unwind(),
+            )
+            .await
+            .map_err(panic_error)?;
             let verdict = handled.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Ok(Pythonized(verdict))
+            serde_json::to_value(verdict)
+                .map(Jsonized)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
         })
     }
 }
@@ -116,6 +138,10 @@ impl NativeCallback {
         let mut values = FieldValues::new(subscription.reads);
         for (name, value) in fields {
             let field: Field = named(&name.extract::<String>()?)?;
+            if field.by_reference() {
+                values.set_payload(payload::stash(value.unbind()));
+                continue;
+            }
             values.insert(field, json_from_py(&value)?);
         }
         Ok(HookInput {

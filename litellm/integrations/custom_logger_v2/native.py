@@ -7,11 +7,20 @@ from typing import Annotated, ClassVar, Final, Literal, Protocol, TypeAlias
 from pydantic import BaseModel, ConfigDict, Discriminator, TypeAdapter
 
 from litellm.integrations.custom_logger_v2.call import CallContext
-from litellm.integrations.custom_logger_v2.enums import Activation, Field, FieldTier, Hook, OptOutBy
+from litellm.integrations.custom_logger_v2.enums import (
+    BY_REFERENCE,
+    DERIVED_ONLY,
+    Activation,
+    Field,
+    FieldTier,
+    Hook,
+    OptOutBy,
+)
 from litellm.integrations.custom_logger_v2.hooks import HOOK_SPECS
 from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2, on
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.selection import Selection
+from litellm.types.integrations.custom_logger_v2 import Strict
 
 
 class NativeHandle(Protocol):
@@ -132,7 +141,13 @@ def verdict(returned: object) -> Patch | Abort | None:
 
 
 def _plain(value: object) -> object:
-    return value.model_dump(mode="json") if isinstance(value, BaseModel) else value
+    if isinstance(value, Strict):
+        return value.model_dump(mode="python")
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, tuple):
+        return tuple(map(_plain, value))  # pyright: ignore[reportUnknownArgumentType]  # a typed field's tuple of records or scalars
+    return value
 
 
 _ABSENT: Final = object()
@@ -233,6 +248,8 @@ def contract_table() -> Mapping[str, object]:
         ],
         "fields": [{"name": field.value, "bit": field.bit, "tier": field.tier.name} for field in Field],
         "tiers": [{"name": tier.name, "rank": tier.value} for tier in FieldTier],
+        "derived_only": sorted(field.value for field in DERIVED_ONLY),
+        "by_reference": sorted(field.value for field in BY_REFERENCE),
         "activations": [activation.value for activation in Activation],
         "opt_out_by": [scope.value for scope in OptOutBy],
     }
