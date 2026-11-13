@@ -54,9 +54,9 @@ fn truthy_int<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>,
     value.filter(|_| truthy).map(int_value).transpose()
 }
 
-fn python_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    Ok(match Value::deserialize(deserializer)? {
-        Value::String(text) => text,
+pub(crate) fn python_text(value: &Value) -> Option<String> {
+    Some(match value {
+        Value::String(text) => text.clone(),
         Value::Null => "None".to_owned(),
         Value::Bool(true) => "True".to_owned(),
         Value::Bool(false) => "False".to_owned(),
@@ -71,11 +71,14 @@ fn python_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::E
             }
             _ => number.to_string(),
         },
-        other => {
-            return Err(serde::de::Error::custom(format!(
-                "a descriptor value must be a scalar, not {other}"
-            )));
-        }
+        Value::Array(_) | Value::Object(_) => return None,
+    })
+}
+
+fn python_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    python_text(&value).ok_or_else(|| {
+        serde::de::Error::custom(format!("a descriptor value must be a scalar, not {value}"))
     })
 }
 

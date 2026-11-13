@@ -5,8 +5,9 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{
-    Abort, Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput, HookOutput,
-    Manifest, Patch, RequestState, Selection, Subscription, Verdict,
+    Abort, Activation, CallFacts, Callback, CallbackError, Field, FieldSet, Hook, HookInput,
+    HookOutput, KeyIdentity, KeyLimits, Manifest, Patch, RequestState, Selection, Subscription,
+    Verdict, typed,
 };
 use litellm_redis_store::{
     RequestRedis,
@@ -16,13 +17,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::{
+    arithmetic::{OutputCapFacts, output_cap},
     batch::{self, BatchFacts},
+    builder::{AuthMetadata, Lookups, Request, RequestFacts},
     descriptor::{Descriptor, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM},
     engine::{Ctx, Engine, Now, Op, Policy, Settlement, SlotAcquisition, Unverifiable},
     enqueued::{EnqueuedOutcome, EnqueuedTokens, process_monotonic},
     ptu::{Ceiling, Usage, settlement_tokens},
     refusal,
-    state::{IoReservation, LimiterState, RateLimitedModel, Stash},
+    settings::{TokenRateLimitType, fail_closed_setting, force_grouping_setting},
+    state::{CapDecision, IoReservation, LimiterState, RateLimitedModel, Stash},
     status::{Code, Response, Status, WindowIdentity, header_map},
 };
 
@@ -40,9 +44,9 @@ const PER_MODEL_KEYS: [&str; 7] = [
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyFacts {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "fail_closed_setting")]
     pub fail_closed: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "force_grouping_setting")]
     pub force_grouping: bool,
 }
 
@@ -226,6 +230,146 @@ pub struct FailureFacts {
     pub partial_usage: Option<Usage>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct EstimateInputs {
+    pub estimated_tokens: Option<i64>,
+    pub ptu_estimate: Option<Estimate>,
+    pub io_estimate: Option<Estimate>,
+    pub cap_applied: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PreCallInputs {
+    pub phase: Phase,
+    pub nested: bool,
+    pub identity: Option<String>,
+    pub policy: PolicyFacts,
+    pub lenient: Map<String, Value>,
+    pub metadata: AuthMetadata,
+    pub lookups: Lookups,
+    pub request: RequestFacts,
+    pub estimates: EstimateInputs,
+    pub batch_call: bool,
+    pub batch: Option<BatchFacts>,
+    pub held_ptu_ceiling: Option<Ceiling>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PostCallSuccessInputs {
+    pub batch: Option<BatchResponseFacts>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PostCallFailureInputs {
+    pub combined_is_usage: bool,
+    pub token_rate_limit_type: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Plan {
+    pub reserves: bool,
+    pub min_tpm_limit: Option<i64>,
+    pub min_otpm_limit: Option<i64>,
+    pub has_io: bool,
+    pub ptu: bool,
+}
+
+const EMBEDDING_CALL_TYPES: [&str; 2] = ["aembedding", "embedding"];
+const RESPONSES_CALL_TYPES: [&str; 2] = ["aresponses", "responses"];
+const EXTRACTION_CALL_TYPES: [&str; 2] = ["extraction", "aextraction"];
+const MCP_TOOL_CALL_TYPE: &str = "call_mcp_tool";
+const DECISIONS_ENDPOINT: &str = "decisions";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CapSettings {
+    pub fraction: f64,
+    pub default_max_tokens_estimate: i64,
+    pub responses_min_output_tokens: i64,
+}
+
+impl Default for CapSettings {
+    fn default() -> Self {
+        Self {
+            fraction: 0.25,
+            default_max_tokens_estimate: 4096,
+            responses_min_output_tokens: 16,
+        }
+    }
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn failed(hook: Hook, what: &str, error: impl std::fmt::Display) -> CallbackError {
+    CallbackError::Failed(format!("the {hook:?} {what} do not decode: {error}"))
+}
+
+fn record_members<T: Serialize>(record: Option<T>) -> Result<Map<String, Value>, CallbackError> {
+    match record.map(serde_json::to_value).transpose() {
+        Ok(Some(Value::Object(members))) => Ok(members),
+        Ok(_) => Ok(Map::new()),
+        Err(error) => Err(failed(Hook::PreCall, "key records", error)),
+    }
+}
+
+fn auth_members(
+    identity: Option<KeyIdentity>,
+    limits: Option<KeyLimits>,
+    lenient: &Map<String, Value>,
+) -> Result<Map<String, Value>, CallbackError> {
+    let mut members = record_members(identity)?;
+    members.extend(record_members(limits)?);
+    members.extend(lenient.clone());
+    Ok(members)
+}
+
+fn prior_response(input: &HookInput) -> Result<Option<PriorResponse>, CallbackError> {
+    let Some(Value::Object(mut statuses)) = input.fields.raw(Field::RateLimitStatuses)?.cloned()
+    else {
+        return Ok(None);
+    };
+    if let Some(Value::Array(rows)) = statuses.get_mut("statuses") {
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            row.retain(|_, member| !member.is_null());
+        }
+    }
+    serde_json::from_value(Value::Object(statuses))
+        .map(Some)
+        .map_err(|error| failed(input.hook, "rate limit statuses", error))
+}
+
+fn cap_decision(input: &HookInput, call: &CallFacts) -> Result<CapDecision, CallbackError> {
+    let call_type = call.kind.call_type.as_str();
+    let explicit = input
+        .fields
+        .get::<typed::OutputCap>()?
+        .and_then(|cap| cap.explicit)
+        .is_some();
+    let embedding = if EMBEDDING_CALL_TYPES.contains(&call_type) {
+        true
+    } else if call_type.is_empty() {
+        input
+            .fields
+            .raw(Field::Input)?
+            .is_some_and(|value| !value.is_null())
+    } else {
+        false
+    };
+    Ok(CapDecision {
+        explicit,
+        exempt: explicit
+            || embedding
+            || call.kind.endpoint_type.as_deref() == Some(DECISIONS_ENDPOINT)
+            || EXTRACTION_CALL_TYPES.contains(&call_type),
+        responses: RESPONSES_CALL_TYPES.contains(&call_type),
+    })
+}
+
 fn scopes_keyed(descriptors: &[Descriptor], key: &str) -> BTreeSet<(String, String)> {
     descriptors
         .iter()
@@ -246,15 +390,7 @@ pub struct ParallelRequestLimiter {
     manifest: Manifest,
     engine: Engine,
     enqueued: EnqueuedTokens,
-}
-
-fn decode<T: DeserializeOwned + Default>(input: &HookInput) -> Result<T, CallbackError> {
-    match input.fields.raw(Field::DeprecatedKwargs)? {
-        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
-            CallbackError::Failed(format!("the {:?} facts do not decode: {error}", input.hook))
-        }),
-        None => Ok(T::default()),
-    }
+    cap: CapSettings,
 }
 
 fn truthy(value: &Option<String>) -> Option<&str> {
@@ -262,7 +398,6 @@ fn truthy(value: &Option<String>) -> Option<&str> {
 }
 
 pub fn manifest() -> Manifest {
-    let kwargs = FieldSet::of(&[Field::DeprecatedKwargs]);
     Manifest {
         selection: Selection {
             activation: Activation::Required,
@@ -270,7 +405,14 @@ pub fn manifest() -> Manifest {
         },
         subscriptions: vec![
             Subscription {
-                reads: kwargs,
+                reads: FieldSet::of(&[
+                    Field::DeprecatedKwargs,
+                    Field::KeyIdentity,
+                    Field::KeyLimits,
+                    Field::RateLimitStatuses,
+                    Field::OutputCap,
+                    Field::Input,
+                ]),
                 writes: FieldSet::of(&[Field::OptionalParams]),
                 may_abort: true,
                 ..Subscription::on(Hook::PreCall)
@@ -281,7 +423,7 @@ pub fn manifest() -> Manifest {
                 ..Subscription::on(Hook::PostCallSuccess)
             },
             Subscription {
-                reads: kwargs,
+                reads: FieldSet::of(&[Field::DeprecatedKwargs, Field::Usage]),
                 awaited: true,
                 ..Subscription::on(Hook::PostCallFailure)
             },
@@ -306,7 +448,12 @@ impl ParallelRequestLimiter {
             manifest: manifest(),
             engine,
             enqueued,
+            cap: CapSettings::default(),
         }
+    }
+
+    pub fn with_cap_settings(self, cap: CapSettings) -> Self {
+        Self { cap, ..self }
     }
 
     pub fn engine(&self) -> &Engine {
@@ -1202,6 +1349,196 @@ impl ParallelRequestLimiter {
         operations
     }
 
+    pub async fn handle_with(&self, input: &HookInput, inputs: Value) -> HookOutput {
+        let Some(state) = input.state::<LimiterState>() else {
+            return Ok(None);
+        };
+        let inputs = if inputs.is_null() {
+            Value::Object(Map::new())
+        } else {
+            inputs
+        };
+        match input.hook {
+            Hook::PreCall => {
+                let inputs: PreCallInputs = port_inputs(input.hook, inputs)?;
+                let Some(facts) = self.pre_call_facts(state, input, inputs)? else {
+                    return Ok(None);
+                };
+                let request = state.request();
+                Ok(self
+                    .pre_call(state, facts, request.as_ref())
+                    .await
+                    .map(Verdict::Abort))
+            }
+            Hook::PostCallSuccess => {
+                let inputs: PostCallSuccessInputs = port_inputs(input.hook, inputs)?;
+                let facts = PostCallSuccessFacts {
+                    call_id: call_id(input),
+                    batch: inputs.batch,
+                };
+                self.post_call_success(state, facts).await;
+                Ok(None)
+            }
+            Hook::PostCallFailure => {
+                let inputs: PostCallFailureInputs = port_inputs(input.hook, inputs)?;
+                let facts = failure_facts(input, &inputs)?;
+                self.post_call_failure(state, facts).await;
+                Ok(None)
+            }
+            Hook::LogPrepare => self.log_prepare(state, input),
+            _ => Ok(None),
+        }
+    }
+
+    fn pre_call_facts(
+        &self,
+        state: &LimiterState,
+        input: &HookInput,
+        inputs: PreCallInputs,
+    ) -> Result<Option<PreCallFacts>, CallbackError> {
+        if matches!(inputs.phase, Phase::Tokens | Phase::Io) {
+            let explicit = state.stash().cap.explicit || inputs.estimates.cap_applied;
+            let Some(stored) = state.stash().pre_call.clone() else {
+                return Ok(None);
+            };
+            return Ok(Some(PreCallFacts {
+                policy: inputs.policy,
+                estimated_tokens: inputs.estimates.estimated_tokens,
+                ptu_estimate: inputs.estimates.ptu_estimate,
+                io_estimate: inputs.estimates.io_estimate.map(|estimate| Estimate {
+                    explicit_output_cap: explicit,
+                    ..estimate
+                }),
+                phase: inputs.phase,
+                ..stored
+            }));
+        }
+        let call = input.call.clone().unwrap_or_default();
+        let call_id = non_empty(&call.ids.call_id);
+        let requested_model = non_empty(&call.target.model);
+        let cap = cap_decision(input, &call)?;
+        let reuses_request_slot = call.kind.call_type == MCP_TOOL_CALL_TYPE
+            && inputs.nested
+            && state.stash().parallel_slot.is_some();
+        let base = PreCallFacts {
+            identity: inputs.identity.clone(),
+            call_id,
+            prior_response: prior_response(input)?,
+            policy: inputs.policy,
+            batch: inputs.batch.clone(),
+            phase: inputs.phase,
+            ..PreCallFacts::default()
+        };
+        let facts = if inputs.batch_call {
+            PreCallFacts {
+                requested_model,
+                ..base
+            }
+        } else {
+            let limits = input.fields.get::<typed::KeyLimits>()?;
+            let rpm_limit_type = limits
+                .as_ref()
+                .and_then(|limits| limits.rpm_limit_type.clone());
+            let tpm_limit_type = limits
+                .as_ref()
+                .and_then(|limits| limits.tpm_limit_type.clone());
+            let auth = auth_members(
+                input.fields.get::<typed::KeyIdentity>()?,
+                limits,
+                &inputs.lenient,
+            )?;
+            let built = Request {
+                auth: &auth,
+                rpm_limit_type: rpm_limit_type.as_deref(),
+                tpm_limit_type: tpm_limit_type.as_deref(),
+                metadata: &inputs.metadata,
+                lookups: &inputs.lookups,
+                request: &inputs.request,
+                requested_model: requested_model.as_deref(),
+                window_size: self.engine.settings().window_size,
+            }
+            .build()
+            .map_err(|error| CallbackError::Failed(error.to_string()))?;
+            let descriptors: Vec<Descriptor> =
+                serde_json::from_value(Value::Array(built.descriptors))
+                    .map_err(|error| failed(input.hook, "descriptors", error))?;
+            PreCallFacts {
+                descriptors,
+                reserved_model: inputs
+                    .lookups
+                    .rate_limited_model(requested_model.as_deref()),
+                requested_model,
+                ptu_ceiling: built.ptu_ceiling.or(inputs.held_ptu_ceiling),
+                reuses_request_slot,
+                ..base
+            }
+        };
+        {
+            let mut stash = state.stash();
+            stash.cap = cap;
+            stash.pre_call = Some(facts.clone());
+        }
+        Ok(Some(facts))
+    }
+
+    pub fn plan(&self, state: &LimiterState) -> Plan {
+        let stash = state.stash();
+        let empty = Vec::new();
+        let (descriptors, ceiling) = stash.pre_call.as_ref().map_or((&empty, None), |facts| {
+            (&facts.descriptors, facts.ptu_ceiling.as_ref())
+        });
+        let tpm_limits: Vec<i64> = descriptors
+            .iter()
+            .filter(|descriptor| !descriptor.is_project_io())
+            .filter_map(|descriptor| {
+                let limit = descriptor.limits().tokens_per_unit?;
+                Some(match ceiling {
+                    Some(ceiling) if descriptor.key == PTU_TEAM => ceiling.raw_output_token_limit(),
+                    _ => limit,
+                })
+            })
+            .collect();
+        Plan {
+            reserves: !tpm_limits.is_empty() && self.engine.settings().tpm_reservation_enabled,
+            min_tpm_limit: tpm_limits.iter().min().copied(),
+            min_otpm_limit: descriptors
+                .iter()
+                .filter(|descriptor| descriptor.key == PROJECT_OTPM)
+                .filter_map(|descriptor| descriptor.limits().tokens_per_unit)
+                .min(),
+            has_io: descriptors.iter().any(Descriptor::is_project_io),
+            ptu: ceiling.is_some(),
+        }
+    }
+
+    pub fn descriptors(&self, state: &LimiterState) -> Vec<Descriptor> {
+        state
+            .stash()
+            .pre_call
+            .as_ref()
+            .map(|facts| facts.descriptors.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn implicit_output_cap(
+        &self,
+        state: &LimiterState,
+        min_configured_limit: Option<i64>,
+        configured_output_tokens: Option<i64>,
+        cap_applied: bool,
+    ) -> Option<i64> {
+        let cap = state.stash().cap;
+        output_cap(&OutputCapFacts {
+            min_configured_limit,
+            responses: cap.responses,
+            exempt: cap.exempt || cap_applied,
+            configured_output_tokens,
+            fraction: self.cap.fraction,
+            default_max_tokens_estimate: self.cap.default_max_tokens_estimate,
+            responses_min_output_tokens: self.cap.responses_min_output_tokens,
+        })
+    }
+
     pub async fn fallback_target_allowed(
         &self,
         state: Option<&LimiterState>,
@@ -1228,10 +1565,10 @@ impl ParallelRequestLimiter {
     }
 
     fn log_prepare(&self, state: &LimiterState, input: &HookInput) -> HookOutput {
-        let facts: CallIdFacts = decode(input)?;
+        let call_id = call_id(input);
         let statuses = {
             let stash = state.stash();
-            if !stash.owned || !stash.for_call(facts.call_id.as_deref()) {
+            if !stash.owned || !stash.for_call(call_id.as_deref()) {
                 return Ok(None);
             }
             stash
@@ -1263,6 +1600,54 @@ impl ParallelRequestLimiter {
             Map::from_iter([("hidden_params".to_owned(), Value::Object(hidden))]),
         ))))
     }
+}
+
+fn port_inputs<T: DeserializeOwned>(hook: Hook, inputs: Value) -> Result<T, CallbackError> {
+    serde_json::from_value(inputs).map_err(|error| failed(hook, "port inputs", error))
+}
+
+fn call_id(input: &HookInput) -> Option<String> {
+    input
+        .call
+        .as_ref()
+        .and_then(|call| non_empty(&call.ids.call_id))
+}
+
+fn failure_facts(
+    input: &HookInput,
+    inputs: &PostCallFailureInputs,
+) -> Result<PostCallFailureFacts, CallbackError> {
+    let combined = input
+        .fields
+        .get::<typed::Usage>()?
+        .and_then(|usage| usage.combined)
+        .filter(|combined| inputs.combined_is_usage && combined.completion_tokens.unwrap_or(0) > 0);
+    let Some(combined) = combined else {
+        return Ok(PostCallFailureFacts::default());
+    };
+    let prompt_tokens = combined.prompt_tokens.unwrap_or(0);
+    let completion_tokens = combined.completion_tokens.unwrap_or(0);
+    let cached_tokens = combined.cached_tokens.unwrap_or(0);
+    let without_cached = |tokens: i64| {
+        if cached_tokens > 0 {
+            (tokens - cached_tokens).max(0)
+        } else {
+            tokens
+        }
+    };
+    let tpm_actual = match TokenRateLimitType::from_setting(&inputs.token_rate_limit_type) {
+        TokenRateLimitType::Output => completion_tokens,
+        TokenRateLimitType::Input => without_cached(prompt_tokens),
+        TokenRateLimitType::Total => without_cached(combined.total_tokens.unwrap_or(0)),
+    };
+    Ok(PostCallFailureFacts {
+        tpm_actual,
+        partial_usage: Some(Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        }),
+    })
 }
 
 fn collect_targets(
@@ -1347,30 +1732,6 @@ impl Callback for ParallelRequestLimiter {
     }
 
     fn handle<'a>(&'a self, input: &'a HookInput) -> BoxFuture<'a, HookOutput> {
-        Box::pin(async move {
-            let Some(state) = input.state::<LimiterState>() else {
-                return Ok(None);
-            };
-            match input.hook {
-                Hook::PreCall => {
-                    let facts: PreCallFacts = decode(input)?;
-                    let request = state.request();
-                    Ok(self
-                        .pre_call(state, facts, request.as_ref())
-                        .await
-                        .map(Verdict::Abort))
-                }
-                Hook::PostCallSuccess => {
-                    self.post_call_success(state, decode(input)?).await;
-                    Ok(None)
-                }
-                Hook::PostCallFailure => {
-                    self.post_call_failure(state, decode(input)?).await;
-                    Ok(None)
-                }
-                Hook::LogPrepare => self.log_prepare(state, input),
-                _ => Ok(None),
-            }
-        })
+        Box::pin(self.handle_with(input, Value::Null))
     }
 }

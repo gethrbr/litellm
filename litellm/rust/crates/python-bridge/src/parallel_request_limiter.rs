@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
-    AuthFacts, Backend, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope, FailureFacts,
-    IoReservation, LimiterState, Op, OutputCapFacts, ParallelRequestLimiter, PolicyFacts, Response,
-    Settings, SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, auth_descriptors,
-    output_cap, process_monotonic,
+    Backend, CapSettings, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope,
+    FailureFacts, IoReservation, LimiterState, Op, ParallelRequestLimiter, PolicyFacts, Response,
+    Settings, SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, process_monotonic,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
 use litellm_redis_store::{Number, rate_limits::Scope};
@@ -145,13 +144,14 @@ fn reply(response: Result<Response, Unverifiable>) -> Value {
 #[pymethods]
 impl NativeParallelRequestLimiter {
     #[new]
-    #[pyo3(signature = (rate_limits, window_size, tpm_reservation_enabled, now = None, monotonic = None))]
+    #[pyo3(signature = (rate_limits, window_size, tpm_reservation_enabled, now = None, monotonic = None, output_cap = None))]
     fn new(
         rate_limits: PyRef<'_, NativeRateLimits>,
         window_size: i64,
         tpm_reservation_enabled: bool,
         now: Option<Py<PyAny>>,
         monotonic: Option<Py<PyAny>>,
+        output_cap: Option<(f64, i64, i64)>,
     ) -> PyResult<Self> {
         let clock = match now {
             Some(now) => python_clock(now),
@@ -169,7 +169,15 @@ impl NativeParallelRequestLimiter {
         let limiter = ParallelRequestLimiter::with_monotonic(
             engine,
             monotonic.map_or_else(process_monotonic, python_clock),
-        );
+        )
+        .with_cap_settings(output_cap.map_or_else(
+            CapSettings::default,
+            |(fraction, default_max_tokens_estimate, responses_min_output_tokens)| CapSettings {
+                fraction,
+                default_max_tokens_estimate,
+                responses_min_output_tokens,
+            },
+        ));
         limiter
             .manifest()
             .validate()
@@ -190,7 +198,8 @@ impl NativeParallelRequestLimiter {
         NativeParallelRequestLimiterState(Arc::new(LimiterState::default()))
     }
 
-    #[pyo3(signature = (hook, fields, call, state, /, request = None))]
+    #[pyo3(signature = (hook, fields, call, state, /, request = None, inputs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn handle<'py>(
         &self,
         py: Python<'py>,
@@ -199,7 +208,9 @@ impl NativeParallelRequestLimiter {
         call: Option<&Bound<'py, PyAny>>,
         state: Option<PyRef<'py, NativeParallelRequestLimiterState>>,
         request: Option<PyRef<'py, NativeRequestRedis>>,
+        inputs: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let inputs: Value = inputs.map(json_from_py).transpose()?.unwrap_or(Value::Null);
         let hook: Hook = named(hook)?;
         let subscription = self
             .limiter
@@ -224,7 +235,7 @@ impl NativeParallelRequestLimiter {
         let limiter = Arc::clone(&self.limiter);
         limiter_async(py, async move {
             let verdict: Option<Verdict> = limiter
-                .handle(&input)
+                .handle_with(&input, inputs)
                 .await
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
             Ok(Pythonized(verdict))
@@ -459,16 +470,30 @@ impl NativeParallelRequestLimiter {
         state.0.stash().parallel_slot.is_some()
     }
 
-    fn auth_descriptors(&self, facts: &str) -> PyResult<String> {
-        let facts: AuthFacts = decoded(facts)?;
-        let built =
-            auth_descriptors(&facts).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        Ok(json!([built.leading, built.organization]).to_string())
+    fn plan(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> PyResult<String> {
+        serde_json::to_string(&self.limiter.plan(&state.0))
+            .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
-    fn output_cap(&self, facts: &str) -> PyResult<Option<i64>> {
-        let facts: OutputCapFacts = decoded(facts)?;
-        Ok(output_cap(&facts))
+    fn descriptors(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> PyResult<String> {
+        serde_json::to_string(&self.limiter.descriptors(&state.0))
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    #[pyo3(signature = (state, min_configured_limit, configured_output_tokens = None, cap_applied = false))]
+    fn implicit_output_cap(
+        &self,
+        state: PyRef<'_, NativeParallelRequestLimiterState>,
+        min_configured_limit: Option<i64>,
+        configured_output_tokens: Option<i64>,
+        cap_applied: bool,
+    ) -> Option<i64> {
+        self.limiter.implicit_output_cap(
+            &state.0,
+            min_configured_limit,
+            configured_output_tokens,
+            cap_applied,
+        )
     }
 
     fn take_parallel_slot<'py>(

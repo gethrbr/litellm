@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     engine::{Op, SlotAcquisition},
     enqueued::EnqueuedReservation,
+    limiter::PreCallFacts,
     ptu::Ceiling,
     status::{Response, WindowIdentity},
 };
@@ -19,8 +20,17 @@ pub struct RateLimitedModel {
     pub group: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CapDecision {
+    pub explicit: bool,
+    pub exempt: bool,
+    pub responses: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Stash {
+    pub pre_call: Option<PreCallFacts>,
+    pub cap: CapDecision,
     pub owned: bool,
     pub first_pass_admitted: bool,
     pub owner_call_id: Option<String>,
