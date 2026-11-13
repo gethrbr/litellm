@@ -298,7 +298,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401, RUF
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
     ParallelRequestLimiterNativeLogger,
-    PreCallInputsScope,
+    PreCallAuthScope,
     native_parallel_request_limiter,
     native_parallel_request_limiter_enabled,
 )
@@ -3573,7 +3573,7 @@ class ProxyLogging:
             )
             request_fields: Final = KwargsFields(run.latest, PROXY_REQUEST_KEYS)
             try:
-                with PreCallInputsScope(run.user_api_key_dict, run.endpoint_type):
+                with PreCallAuthScope(run.user_api_key_dict):
                     result: Final = await run_subscribers(
                         subscribers,
                         with_slots(

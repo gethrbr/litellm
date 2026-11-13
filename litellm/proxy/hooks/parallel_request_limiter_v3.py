@@ -1259,7 +1259,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         data: dict[str, object],  # mutable-ok: the cap is written into the routed request
         call_type: str | None,
         effective_cap: int,
-    ) -> None:
+    ) -> bool:
         if call_type in GOOGLE_GENAI_NATIVE_CALL_TYPES:
             config_field: Final = "config" if "config" in data or "generationConfig" not in data else "generationConfig"
             config: Final = data.get(config_field)
@@ -1268,11 +1268,14 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     **(config or {}),
                     "maxOutputTokens": effective_cap,
                 }
-            return
+                return True
+            return False
         cap_field: Final = "max_output_tokens" if call_type in RESPONSES_API_CALL_TYPES else "max_tokens"
         existing_cap: Final = data.get(cap_field)
         if existing_cap is None or effective_cap < existing_cap:  # pyright: ignore[reportOperatorIssue]  # an unparsable existing cap fails as it always has
             data[cap_field] = effective_cap  # rebind-ok: downstream routing requires the bounded output cap
+            return True
+        return False
 
     def estimate_request_tokens(
         self,

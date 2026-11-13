@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 import redis
@@ -20,10 +20,13 @@ import litellm
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, CallIds, CallKind, CallTarget, CallTiming
+from litellm.integrations.custom_logger_v2.enforcement import FieldView
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.legacy import PROXY_REQUEST_KEYS, KwargsFields
 from litellm.integrations.custom_logger_v2.native import NativeState
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.patches import apply_patch
+from litellm.integrations.custom_logger_v2.slots import HookArgs, Slot, with_slots
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
@@ -33,22 +36,30 @@ from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
     PROXY_MaxParallelRequestsHandler_v3,
+    RateLimitDescriptor,
     _request_stash,
     get_request_stash,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
     ParallelRequestLimiterNativeLogger,
+    PreCallAuthScope,
+    _write_output_cap,  # pyright: ignore[reportPrivateUsage]  # the glue's cap write under test
+    limiter_state,
     native_parallel_request_limiter,
-    PreCallInputsScope,
 )
 from litellm.proxy.utils import InternalUsageCache, ProxyLogging
+from litellm.proxy.v2_fields import POST_CALL_FAILURE_PROXY_SLOTS, PRE_CALL_SLOTS, proxy_call_facts
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.utils import CallTypes, ModelResponse, Usage
 
 pytest.importorskip("litellm.rust_bridge._native")
 
+if TYPE_CHECKING:
+    from litellm.rust_bridge._native import NativeParallelRequestLimiterState
+
 _READS: Final = frozenset({Field.deprecated_kwargs})
+_DESCRIPTORS: Final = TypeAdapter(list[RateLimitDescriptor])
 
 
 class Clock:
@@ -221,6 +232,24 @@ def _ctx(side: Side, index: int, hook: Hook, request: Request) -> CallContext[ob
     )
 
 
+def _proxy_ctx(side: Side, index: int, hook: Hook, request: Request, data: Mapping[str, object]) -> CallContext[object]:
+    return CallContext(
+        hook=hook,
+        call=proxy_call_facts(data, request.call_type, request.auth, request.endpoint_type.value),
+        state=side.states.get(index),
+    )
+
+
+def _proxy_view(request: Request, data: dict[str, object], slots: Mapping[Field, Slot]) -> FieldView:
+    return FieldView(
+        with_slots(
+            KwargsFields(data, PROXY_REQUEST_KEYS),
+            slots,
+            HookArgs(auth=request.auth, request=data, call_type=request.call_type),
+        )
+    )
+
+
 async def _admit(side: Side, index: int, request: Request) -> object:
     if not request.nested:
         _request_stash.set(None)
@@ -234,12 +263,12 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             request_state = side.native.request_state
             assert request_state is not None
             side.states[index] = request_state()
-            with PreCallInputsScope(request.auth, request.endpoint_type):
+            with PreCallAuthScope(request.auth):
                 outcome = await side.native.run_native(
                     Hook.pre_call,
                     _READS,
-                    SimpleNamespace(deprecated_kwargs=data),
-                    _ctx(side, index, Hook.pre_call, request),
+                    _proxy_view(request, data, PRE_CALL_SLOTS),
+                    _proxy_ctx(side, index, Hook.pre_call, request, data),
                 )
             state = side.states[index]
             assert isinstance(state, NativeState)
@@ -358,8 +387,8 @@ async def _ended(
                 await side.native.run_native(
                     Hook.post_call_failure,
                     _READS,
-                    SimpleNamespace(deprecated_kwargs=data),
-                    _ctx(side, index, Hook.post_call_failure, request),
+                    _proxy_view(request, data, POST_CALL_FAILURE_PROXY_SLOTS),
+                    _proxy_ctx(side, index, Hook.post_call_failure, request, data),
                 )
             await side.limiter.async_post_call_failure_hook(data, Exception("guardrail"), request.auth)
         case "disconnect":
@@ -1310,24 +1339,75 @@ _AUTH_VARIANTS: Final[tuple[Mapping[str, object], ...]] = (
 )
 
 
+def _set_limits(descriptors: Sequence[RateLimitDescriptor]) -> list[tuple[str, str, Mapping[str, object]]]:
+    return [
+        (
+            descriptor["key"],
+            descriptor["value"],
+            {name: limit for name, limit in (descriptor["rate_limit"] or {}).items() if limit is not None},
+        )
+        for descriptor in descriptors
+    ]
+
+
+async def _native_first_pass(
+    side: Side, request: Request, data: dict[str, object]
+) -> "NativeParallelRequestLimiterState":
+    native: Final = side.native
+    assert native is not None
+    request_state: Final = native.request_state
+    assert request_state is not None
+    _request_stash.set(None)
+    side.states[0] = request_state()
+    with PreCallAuthScope(request.auth):
+        await native.run_native(
+            Hook.pre_call,
+            _READS,
+            _proxy_view(request, data, PRE_CALL_SLOTS),
+            _proxy_ctx(side, 0, Hook.pre_call, request, data),
+        )
+    state: Final[object] = side.states[0]
+    assert isinstance(state, NativeState)
+    handle: Final = limiter_state(state.handle)
+    assert handle is not None
+    return handle
+
+
+def _failures(model_has_failures: bool) -> Callable[..., Awaitable[bool]]:
+    async def failures(**_: object) -> bool:
+        return model_has_failures
+
+    return failures
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limits", _AUTH_VARIANTS)
 @pytest.mark.parametrize("rpm_limit_type", (None, "dynamic", "guaranteed_throughput"))
 @pytest.mark.parametrize("tpm_limit_type", (None, "dynamic"))
 @pytest.mark.parametrize("model_has_failures", (False, True))
 async def test_auth_descriptors_are_built_in_rust_like_python(
-    limits: Mapping[str, object], rpm_limit_type: str | None, tpm_limit_type: str | None, model_has_failures: bool
+    limits: Mapping[str, object],
+    rpm_limit_type: str | None,
+    tpm_limit_type: str | None,
+    model_has_failures: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     side: Final = _side(Clock(), native=True)
     assert side.native is not None
-    auth: Final = UserAPIKeyAuth(**{"api_key": _KEY, **limits})  # pyright: ignore[reportArgumentType]  # pydantic fields by keyword
-    leading, organization = side.native._auth_descriptors(auth)(rpm_limit_type, tpm_limit_type, model_has_failures)  # pyright: ignore[reportPrivateUsage]  # the arithmetic under test
-    assert leading == side.limiter._leading_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the Python reference
-        auth, rpm_limit_type, tpm_limit_type, model_has_failures
+    monkeypatch.setattr(side.limiter, "_check_model_has_recent_failures", _failures(model_has_failures))
+    types: Final = {
+        name: value
+        for name, value in (("rpm_limit_type", rpm_limit_type), ("tpm_limit_type", tpm_limit_type))
+        if value is not None
+    }
+    auth: Final = UserAPIKeyAuth(**{"api_key": _KEY, **limits, "metadata": types})  # pyright: ignore[reportArgumentType]  # pydantic fields by keyword
+    request: Final = Request(auth, _CHAT)
+    handle: Final = await _native_first_pass(side, request, _data(0, request))
+    native: Final = _DESCRIPTORS.validate_json(side.native.bridge.descriptors(handle))
+    python: Final = await side.limiter._build_request_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the Python reference
+        auth, _data(0, request), request.call_type
     )
-    assert side.limiter.create_organization_rate_limit_descriptor(auth, None, organization) == (
-        side.limiter.create_organization_rate_limit_descriptor(auth, None)
-    )
+    assert _set_limits(native) == _set_limits(python)
 
 
 _CAP_BODIES: Final[tuple[tuple[str, Mapping[str, object]], ...]] = (
@@ -1362,7 +1442,11 @@ async def test_the_implicit_output_cap_is_decided_in_rust_like_python(
     PROXY_MaxParallelRequestsHandler_v3._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the Python reference
         python, min_limit, call_type, configured_output_tokens, endpoint_type
     )
-    side.native._apply_output_cap(native, min_limit, call_type, endpoint_type, configured_output_tokens)  # pyright: ignore[reportPrivateUsage]  # the arithmetic under test
+    request: Final = Request(_auth(), body, call_type=call_type, endpoint_type=endpoint_type)
+    handle: Final = await _native_first_pass(side, request, _data(0, request))
+    _write_output_cap(
+        native, call_type, side.native.bridge.implicit_output_cap(handle, min_limit, configured_output_tokens)
+    )
     assert native == python
 
 
