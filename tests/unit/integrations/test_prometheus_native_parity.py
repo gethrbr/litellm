@@ -16,19 +16,27 @@ from prometheus_client.registry import Collector
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.caching.dual_cache import DualCache
 from litellm.integrations.custom_logger_v2.enums import Hook
+from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.legacy import Admit, KwargsFields, hook_subscribers, run_subscribers
 from litellm.integrations.prometheus import PrometheusLogger
-from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
+from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS, _in_memory_loggers
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.prometheus_helpers.native_store import (
     NATIVE_PROMETHEUS_ENV,
     NativeFamilyCollector,
+    NativeTicket,
     PrometheusCompanion,
+    Stopped,
     native_prometheus_enabled,
 )
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, Member, UserAPIKeyAuth
+from litellm.proxy.common_utils.callback_utils import initialize_callbacks_on_proxy
+from litellm.proxy.utils import ProxyLogging
+from litellm.router_utils.cooldown_callbacks import get_prometheus_logger_from_callbacks
 from litellm.rust_bridge import _native
+from litellm.utils import add_configured_callback_to_specific_event
 
 START: Final = datetime(2026, 11, 13, 9, 0, 0)  # noqa: DTZ001  # callback timestamps use the legacy naive contract
 _CREATED: Final = re.compile(r"^(\S+_created(?:\{.*\})?) \S+$", re.MULTILINE)
@@ -708,10 +716,71 @@ _CALLBACK_LISTS: Final = (
 _TIMED: Final = re.compile(r"latency|seconds|duration|_time|_created|overhead")
 
 
-_REGISTRATIONS: Final = {
-    "callbacks": ("callbacks",),
-    "success_and_failure_callback": ("success_callback", "failure_callback"),
+Registration: TypeAlias = Callable[[], Mapping[str, object]]
+
+
+def _instance_in(*names: str) -> Registration:
+    def register() -> Mapping[str, object]:
+        logger: Final = PrometheusLogger()
+        for name in names:
+            setattr(litellm, name, [logger])
+        return {}
+
+    return register
+
+
+def _string_in(*names: str) -> Registration:
+    def register() -> Mapping[str, object]:
+        for name in names:
+            setattr(litellm, name, ["prometheus"])
+        return {}
+
+    return register
+
+
+def _configured_events() -> Mapping[str, object]:
+    add_configured_callback_to_specific_event("prometheus", "success")
+    add_configured_callback_to_specific_event("prometheus", "failure")
+    return {}
+
+
+def _proxy_startup() -> Mapping[str, object]:
+    _ = _string_in("callbacks")()
+    ProxyLogging(user_api_key_cache=DualCache())._init_litellm_callbacks()
+    return {}
+
+
+def _config_reload() -> Mapping[str, object]:
+    initialize_callbacks_on_proxy(value=["prometheus"], premium_user=False, config_file_path="", litellm_settings={})
+    return {}
+
+
+def _dynamic(global_too: bool) -> Registration:
+    def register() -> Mapping[str, object]:
+        _ = _string_in("callbacks")() if global_too else None
+        return {"success_callback": ["prometheus"], "failure_callback": ["prometheus"]}
+
+    return register
+
+
+_REGISTRATIONS: Final[Mapping[str, tuple[Registration, Literal["native", "fallback"]]]] = {
+    "instance_in_callbacks": (_instance_in("callbacks"), "native"),
+    "string_in_callbacks": (_string_in("callbacks"), "native"),
+    "proxy_startup": (_proxy_startup, "native"),
+    "config_reload": (_config_reload, "native"),
+    "configured_success_and_failure_events": (_configured_events, "native"),
+    "string_in_success_and_failure_callback": (_string_in("success_callback", "failure_callback"), "native"),
+    "dynamic_and_global": (_dynamic(True), "native"),
+    "instance_in_success_and_failure_callback": (_instance_in("success_callback", "failure_callback"), "fallback"),
+    "instance_in_async_lists": (_instance_in("_async_success_callback", "_async_failure_callback"), "fallback"),
+    "dynamic_only": (_dynamic(False), "fallback"),
 }
+_PYTHON_EMITS_NOTHING: Final = frozenset(
+    {
+        ("instance_in_success_and_failure_callback", "stream"),
+        ("instance_in_success_and_failure_callback", "failure"),
+    }
+)
 _SCENARIOS: Final[Mapping[str, Mapping[str, object]]] = {
     "success": {"mock_response": "hi there"},
     "stream": {"mock_response": "hi there", "stream": True},
@@ -727,16 +796,19 @@ def _kept(line: str) -> bool:
     return _TIMED.search(name) is None or (name.endswith("_count") and not name.endswith("_created"))
 
 
-async def _completion_text(native: bool, registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch) -> str:
+def _fresh_loggers(native: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     if native:
         monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
     else:
         monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
     for name in _CALLBACK_LISTS:
         monkeypatch.setattr(litellm, name, [])
-    logger: Final = PrometheusLogger()
-    for name in _REGISTRATIONS[registration]:
-        monkeypatch.setattr(litellm, name, [logger])
+    _in_memory_loggers[:] = [logger for logger in _in_memory_loggers if not isinstance(logger, PrometheusLogger)]
+
+
+async def _completion_text(native: bool, registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    _fresh_loggers(native, monkeypatch)
+    dynamic: Final = _REGISTRATIONS[registration][0]()
     options: Final = dict(_SCENARIOS[scenario])
     queue: Final = options.pop("queue_time_seconds", None)
     metadata: Final[dict[str, object]] = {
@@ -752,6 +824,7 @@ async def _completion_text(native: bool, registration: str, scenario: str, monke
             messages=[{"role": "user", "content": "hello"}],
             metadata=metadata,
             **options,
+            **dynamic,
         )
         if isinstance(response, CustomStreamWrapper):
             assert [chunk.id async for chunk in response]
@@ -762,20 +835,44 @@ async def _completion_text(native: bool, registration: str, scenario: str, monke
     return "\n".join(line for line in text.splitlines() if _kept(line))
 
 
+@pytest.fixture
+def native_recordings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    recorded: Final[list[str]] = []
+    original: Final = PrometheusCompanion._recorded
+
+    async def counted(companion: PrometheusCompanion, ticket: NativeTicket, ctx: CallContext[object]) -> Stopped | None:
+        recorded.append(ticket.event)
+        return await original(companion, ticket, ctx)
+
+    monkeypatch.setattr(PrometheusCompanion, "_recorded", counted)
+    return recorded
+
+
+@pytest.fixture
+def saved_in_memory_loggers() -> Generator[None]:
+    saved: Final = tuple(_in_memory_loggers)
+    yield
+    _in_memory_loggers[:] = saved
+
+
 @pytest.mark.parametrize("scenario", list(_SCENARIOS))
 @pytest.mark.parametrize("registration", list(_REGISTRATIONS))
-async def test_a_real_acompletion_emits_the_same_metrics_through_the_rust_store(
-    registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.usefixtures("saved_in_memory_loggers")
+async def test_every_registration_path_emits_each_request_exactly_once_as_python_does(
+    registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch, native_recordings: list[str]
 ) -> None:
     _ = await _completion_text(False, registration, scenario, monkeypatch)
     _clear_registry()
     python_text: Final = await _completion_text(False, registration, scenario, monkeypatch)
+    assert native_recordings == []
     _clear_registry()
     native_text: Final = await _completion_text(True, registration, scenario, monkeypatch)
 
     assert any(isinstance(collector, NativeFamilyCollector) for collector in _logger_collectors())
     assert native_text == python_text
-    if registration != "callbacks" and scenario in ("stream", "failure"):
+    expected_event: Final = "failure" if scenario == "failure" else "success"
+    assert native_recordings == ([expected_event] if _REGISTRATIONS[registration][1] == "native" else [])
+    if (registration, scenario) in _PYTHON_EMITS_NOTHING:
         return
     if scenario == "failure":
         assert "litellm_llm_api_failed_requests_metric_total{" in native_text
@@ -789,7 +886,51 @@ async def test_a_real_acompletion_emits_the_same_metrics_through_the_rust_store(
         native_text,
         re.MULTILINE,
     )
-    assert (failures is not None and failures.group(1) == "1.0") is (scenario == "callback_error")
+    assert (failures is not None and failures.group(1) == "1.0") is (
+        scenario == "callback_error" and registration != "dynamic_only"
+    )
+
+
+def _sync_completion_text(native: bool, registration: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    _fresh_loggers(native, monkeypatch)
+    _ = _REGISTRATIONS[registration][0]()
+    _ = litellm.completion(model="gpt-4o-mini", messages=[{"role": "user", "content": "hello"}], mock_response="hi")
+    return generate_latest(_ours()).decode()
+
+
+@pytest.mark.parametrize("registration", ["instance_in_callbacks", "instance_in_success_and_failure_callback"])
+@pytest.mark.usefixtures("saved_in_memory_loggers")
+def test_a_sync_completion_emits_nothing_on_either_side(
+    registration: str, monkeypatch: pytest.MonkeyPatch, native_recordings: list[str]
+) -> None:
+    python_text: Final = _sync_completion_text(False, registration, monkeypatch)
+    _clear_registry()
+    native_text: Final = _sync_completion_text(True, registration, monkeypatch)
+
+    assert native_recordings == []
+    assert "litellm_total_tokens_metric_total{" not in python_text
+    assert native_text == python_text
+
+
+def _cooled_down_text(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+    _fresh_loggers(native, monkeypatch)
+    _ = _proxy_startup()
+    logger: Final = get_prometheus_logger_from_callbacks()
+    assert isinstance(logger, PrometheusLogger)
+    assert (logger.v2_companion is not None) is native
+    logger.increment_deployment_cooled_down("gpt-4o-mini", "id-1", "https://api.openai.com", "openai", "429")
+    text: Final = generate_latest(_ours()).decode()
+    return "\n".join(line for line in text.splitlines() if _kept(line))
+
+
+@pytest.mark.usefixtures("saved_in_memory_loggers")
+def test_the_router_cooldown_lookup_reaches_the_native_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    python_text: Final = _cooled_down_text(False, monkeypatch)
+    _clear_registry()
+    native_text: Final = _cooled_down_text(True, monkeypatch)
+
+    assert re.search(r"^litellm_deployment_cooled_down_total\{.*\} 1\.0$", native_text, re.MULTILINE)
+    assert native_text == python_text
 
 
 def test_multiprocess_mode_keeps_the_python_logger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
