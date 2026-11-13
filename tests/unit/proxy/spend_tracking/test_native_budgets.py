@@ -236,6 +236,26 @@ async def test_native_admission_matches_python(store: SpendCounterStore, identit
     assert _entries(native.reservation) == _entries(python.reservation)
 
 
+@pytest.mark.asyncio
+async def test_a_runtime_change_to_the_budget_exceeded_status_code_reaches_the_next_refusal(
+    store: SpendCounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity: Final = CASES["team_at_max_refuses"]
+    seen: Final[dict[int, tuple[object, object, int | None]]] = {}  # mutable-ok: one entry per status code
+    for code in (402, 429):
+        monkeypatch.setattr(litellm, "budget_exceeded_status_code", code)
+        store.flush_local()
+        python = await _python_admit(store, identity)
+        store.flush_local()
+        native = await _native_admit(store, identity, f"call-status-{code}")
+        seen[code] = (_refusal_fields(python.refusal), _refusal_fields(native.refusal), native.abort_status)
+
+    assert {code: (python, status) for code, (python, _, status) in seen.items()} == {
+        code: (native, code) for code, (_, native, _) in seen.items()
+    }
+    assert seen[402][0] != seen[429][0]
+
+
 Settle: TypeAlias = Callable[[dict[str, object]], Awaitable[object]]
 
 SETTLEMENTS: Final = {

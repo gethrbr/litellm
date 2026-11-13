@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 import litellm
+from litellm.caching import DualCache
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy import proxy_server
 from litellm.proxy._types import LiteLLM_TeamTableCachedObj, ProxyErrorTypes, ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.auth_checks import cache_key_object, cache_team_object
@@ -25,6 +27,7 @@ from litellm.proxy.spend_tracking.budget_reservation import reconcile_budget_res
 from litellm.proxy.utils import ProxyLogging, hash_token
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.types.utils import CallTypesLiteral
 
 API_KEY: Final = "sk-native-path"
 TOKEN: Final = hash_token(API_KEY)
@@ -597,3 +600,91 @@ async def test_a_client_that_disconnects_during_pre_call_leaves_no_hold_like_pyt
 
     assert python[KEY_COUNTER] > 0.0, "the flag-off run must charge the input cost on cancel"
     assert native == python
+
+
+async def _admit_twice(proxy: Proxy, native: bool) -> Run:
+    _use_native(proxy, native)
+    auth, data = await _admit(proxy, f"call-fallback-{native}")
+    reservation: Final = auth.budget_reservation
+    assert reservation is not None
+    _ = await proxy.logging.pre_call_hook(user_api_key_dict=auth, data=dict(data), call_type="completion")
+    assert auth.budget_reservation is reservation
+    return Run(
+        entries_after_pre_call=[
+            {key: entry[key] for key in ("counter_key", "entity_type", "reserved_cost")}
+            for entry in reservation["entries"]  # pyright: ignore[reportGeneralTypeIssues]  # the entries list the reservation carries
+        ],
+        held_after_pre_call=dict(proxy.store.snapshot()),
+        settled={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_second_pre_call_for_the_same_auth_reserves_once_like_python(proxy: Proxy) -> None:
+    python: Final = await _admit_twice(proxy, native=False)
+    native: Final = await _admit_twice(proxy, native=True)
+
+    assert python.entries_after_pre_call, (
+        "the flag-off run must hold a reservation for this comparison to mean anything"
+    )
+    assert native == python
+    assert native.held_after_pre_call[KEY_COUNTER] == pytest.approx(
+        sum(float(entry["reserved_cost"]) for entry in native.entries_after_pre_call)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownArgumentType, reportUnknownVariableType]  # entries are the dicts built above
+    )
+
+
+class _NextSubscriber(CustomLogger):
+    def __init__(self) -> None:
+        self.seen: list[tuple[object, object]] = []  # mutable-ok: what each pre_call saw
+
+    async def async_pre_call_hook(
+        self, user_api_key_dict: UserAPIKeyAuth, cache: DualCache, data: dict, call_type: CallTypesLiteral
+    ) -> None:
+        reservation: Final = user_api_key_dict.budget_reservation
+        self.seen.append((reservation, None if reservation is None else list(reservation["entries"])))  # pyright: ignore[reportArgumentType]  # the entries list the reservation carries
+
+
+async def _seen_by_the_next_subscriber(proxy: Proxy, native: bool) -> tuple[object, object]:
+    _use_native(proxy, native)
+    subscriber: Final = _NextSubscriber()
+    litellm.callbacks.append(subscriber)
+    auth: Final = await _authenticate(proxy, max_budget=1.0)
+    shared: Final = auth.budget_reservation
+    assert shared is not None
+    _ = await proxy.logging.pre_call_hook(
+        user_api_key_dict=auth, data={**BODY, "litellm_call_id": f"call-next-{native}"}, call_type="completion"
+    )
+    assert len(subscriber.seen) == 1
+    reservation, entries = subscriber.seen[0]
+    assert reservation is shared
+    assert auth.budget_reservation is shared
+    return entries, shared["reserved_cost"]
+
+
+@pytest.mark.asyncio
+async def test_the_next_pre_call_subscriber_sees_the_reservation_written_into_the_auth_dict(proxy: Proxy) -> None:
+    python: Final = await _seen_by_the_next_subscriber(proxy, native=False)
+    native: Final = await _seen_by_the_next_subscriber(proxy, native=True)
+
+    assert python[0], "the flag-off run must hold a reservation before the next subscriber runs"
+    assert native == python
+
+
+@pytest.mark.parametrize("route", REFUSED_ROUTES.values(), ids=REFUSED_ROUTES.keys())
+def test_a_runtime_change_to_the_budget_exceeded_status_code_reaches_the_next_refusal_like_python(
+    proxy: Proxy, monkeypatch: pytest.MonkeyPatch, route: tuple[str, Mapping[str, object]]
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    path, body = route
+    refusals: Final[dict[int, tuple[Refusal, Refusal]]] = {}  # mutable-ok: one pair per status code
+    for code in (402, 429):
+        monkeypatch.setattr(litellm, "budget_exceeded_status_code", code)
+        refusals[code] = (
+            _refused_over_http(proxy, False, monkeypatch, path, body),
+            _refused_over_http(proxy, True, monkeypatch, path, body),
+        )
+
+    assert {code: python.status for code, (python, _) in refusals.items()} == {402: 402, 429: 429}
+    assert {code: native for code, (_, native) in refusals.items()} == {
+        code: python for code, (python, _) in refusals.items()
+    }
