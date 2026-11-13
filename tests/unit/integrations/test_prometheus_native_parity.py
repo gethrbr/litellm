@@ -2,10 +2,11 @@ import asyncio
 import copy
 import logging
 import re
-from collections.abc import Callable, Generator, Mapping
+import traceback
+from collections.abc import Awaitable, Callable, Generator, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal, TypeAlias
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -15,11 +16,15 @@ from prometheus_client.registry import Collector
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.integrations.custom_logger_v2.enums import Hook
+from litellm.integrations.custom_logger_v2.legacy import Admit, KwargsFields, hook_subscribers, run_subscribers
 from litellm.integrations.prometheus import PrometheusLogger
+from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.prometheus_helpers.native_store import (
     NATIVE_PROMETHEUS_ENV,
     NativeFamilyCollector,
+    PrometheusCompanion,
     native_prometheus_enabled,
 )
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, Member, UserAPIKeyAuth
@@ -266,19 +271,36 @@ CORPUS: Final = (
 )
 
 
-async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+Mode: TypeAlias = Literal["python", "native", "fallback"]
+MODES: Final[tuple[Mode, ...]] = ("native", "fallback")
+
+
+def _flag(mode: Mode, monkeypatch: pytest.MonkeyPatch) -> None:
+    if mode == "python":
+        monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
+
+
+def _line_of(logger: PrometheusLogger, mode: Mode) -> tuple[object, ...]:
+    if mode == "native":
+        assert isinstance(logger.v2_companion, PrometheusCompanion)
+        return (logger, logger.v2_companion)
+    return (logger,)
+
+
+async def _drive(mode: Mode, monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr("time.time", lambda: 1_763_000_000.25)
     monkeypatch.setattr("litellm.integrations.prometheus.datetime", _FixedDatetime)
-    if native:
-        monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
-    else:
-        monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
+    _flag(mode, monkeypatch)
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    monkeypatch.setattr(litellm, "_async_failure_callback", [])
     logger: Final = PrometheusLogger()
-    assert (logger._native_store is not None) is native
+    assert (logger._native_store is not None) is (mode != "python")
     lines: Final = _Lines()
     verbose_logger.addHandler(lines)
     try:
-        text: Final = await _driven(logger)
+        text: Final = await _driven(logger, _line_of(logger, mode))
     finally:
         verbose_logger.removeHandler(lines)
     return text + "\n".join(lines.seen)
@@ -291,31 +313,62 @@ class _Lines(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         message: Final = record.getMessage()
-        if _LOGGED.match(message):
+        if _NON_BLOCKING.match(message):
+            self.seen.append(
+                f"{record.levelname} {_NON_BLOCKING.pattern.replace(chr(92), '')} raised {message.strip().splitlines()[-1]}"
+            )
+        elif _LOGGED.match(message):
             self.seen.append(f"{record.levelname} {message}")
 
 
 _LOGGED: Final = re.compile(
     r"(Prometheus Error|prometheus Layer Error|\[Non-Blocking\] Prometheus: Budget|Error recording)"
 )
+_NON_BLOCKING: Final = re.compile(r"LiteLLM\.LoggingError: \[Non-Blocking\] Exception occurred while success logging")
+Event: TypeAlias = Literal["success", "failure"]
 
 
-async def _success_outcome(logger: PrometheusLogger, kwargs: dict[str, object]) -> str:
-    response: Final = kwargs.pop("_response", None)
+def _deliver(event: Event, response: object, callback: object, kwargs: object) -> Awaitable[None] | None:
+    if not isinstance(callback, PrometheusLogger) or not isinstance(kwargs, dict):
+        return None
+    return _delivered(event, response, callback, kwargs)
+
+
+async def _delivered(event: Event, response: object, logger: PrometheusLogger, kwargs: dict[str, object]) -> None:
     try:
-        await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
-    except Exception as error:  # noqa: BLE001  # parity compares what each side raises to the logging caller
-        return f"success raised: {type(error).__name__}: {error}"
-    return "success ok"
+        if event == "success":
+            await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
+        else:
+            await logger.async_log_failure_event(kwargs, None, kwargs["start_time"], kwargs["end_time"])
+    except Exception:  # noqa: BLE001  # mirrors Logging._deliver_async_success_to
+        verbose_logger.error(
+            "LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging %s", traceback.format_exc()
+        )
+        for callback in litellm.logging_callback_manager.get_all_callbacks():
+            if isinstance(callback, PrometheusLogger):
+                callback.increment_callback_logging_failure(callback_name=type(logger).__name__)
+                break
 
 
-async def _driven(logger: PrometheusLogger) -> str:
-    raised: Final = [await _success_outcome(logger, kwargs) for kwargs in copy.deepcopy(CORPUS)]
-    outcomes: Final = await _direct_calls(logger)
-    return generate_latest(_ours()).decode() + "\n".join(raised + outcomes) + "\n"
+async def _line(line: tuple[object, ...], kwargs: dict[str, object], event: Event) -> None:
+    response: Final = kwargs.pop("_response", None)
+    litellm._async_success_callback[:] = list(line) if event == "success" else []
+    litellm._async_failure_callback[:] = list(line) if event == "failure" else []
+    _ = await run_subscribers(
+        hook_subscribers(Hook.attempt_ended, line, admit=Admit.every_entry),
+        KwargsFields(kwargs, LOGGING_KEYS),
+        lambda callback, current: _deliver(event, response, callback, current),
+    )
 
 
-async def _direct_calls(logger: PrometheusLogger) -> list[str]:
+async def _driven(logger: PrometheusLogger, line: tuple[object, ...]) -> str:
+    for kwargs in copy.deepcopy(CORPUS):
+        await _line(line, kwargs, "success")
+    outcomes: Final = await _direct_calls(logger, line)
+    return generate_latest(_ours()).decode() + "\n".join(outcomes) + "\n"
+
+
+async def _direct_calls(logger: PrometheusLogger, line: tuple[object, ...]) -> list[str]:
     failure: Final = _failure(
         10, litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini")
     )
@@ -361,7 +414,7 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         metadata={"user_api_key_team_id": "team-broken"},
     )
     for event in (failure, rejected, broken):
-        await logger.async_log_failure_event(event, None, event["start_time"], event["end_time"])
+        await _line(line, event, "failure")
     original: Final = litellm.RateLimitError(message="slow", llm_provider="openai", model="gpt-4o-mini")
     fallback_kwargs: Final = {
         "model": "gpt-4o",
@@ -554,36 +607,43 @@ CONFIGS: Final[Mapping[str, Mapping[str, object]]] = {
 }
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("config", list(CONFIGS))
-async def test_the_native_store_and_handler_expose_exactly_what_the_python_logger_does(
-    config: str, monkeypatch: pytest.MonkeyPatch
+async def test_the_native_callback_and_the_fallback_expose_exactly_what_the_python_logger_does(
+    config: str, mode: Mode, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name, value in CONFIGS[config].items():
         setattr(litellm, name, copy.deepcopy(value))
-    python_text: Final = await _drive(False, monkeypatch)
+    python_text: Final = await _drive("python", monkeypatch)
     _clear_registry()
-    native_text: Final = await _drive(True, monkeypatch)
+    native_text: Final = await _drive(mode, monkeypatch)
 
     assert "litellm_spend_metric" in python_text or config.startswith("excludes")
     assert _masked(native_text) == _masked(python_text)
     assert ('input_sequence_length="1k-4k"' in python_text) is (config == "input_sequence_length")
     if config == "defaults":
+        raised: Final = "ERROR LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging raised"
         assert "ERROR prometheus Layer Error(): Exception occured - 'reason'" in python_text
-        assert "success raised: ValueError: could not convert string to float: 'ten'" in python_text
-        assert "success raised: TypeError: '>=' not supported between instances of 'str' and 'int'" in python_text
+        assert f"{raised} ValueError: could not convert string to float: 'ten'" in python_text
+        assert f"{raised} TypeError: '>=' not supported between instances of 'str' and 'int'" in python_text
         assert "TypeError: float() argument must be a string or a real number, not 'list'" in python_text
+        assert re.search(
+            r'^litellm_callback_logging_failures_metric_total\{callback_name="PrometheusLogger"\} [1-9]',
+            python_text,
+            re.MULTILINE,
+        )
         assert "ERROR Prometheus Error: set_llm_deployment_success_metrics. Exception occured" in python_text
         assert 'team="team-raise"' in python_text
         assert 'litellm_remaining_team_budget_metric{team="team-raise"' not in python_text
         assert 'org_id="org-dst"} 3044.0' in python_text
 
 
-async def _shared_call_id_lines(native: bool, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    if native:
-        monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
-    else:
-        monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
+async def _shared_call_id_lines(mode: Mode, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    _flag(mode, monkeypatch)
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    monkeypatch.setattr(litellm, "_async_failure_callback", [])
     logger: Final = PrometheusLogger()
+    line: Final = _line_of(logger, mode)
     shared: Final = [
         {
             **_event(20 + index, user=user, metadata={"user_api_key_team_id": f"team-{user}"}),
@@ -591,15 +651,15 @@ async def _shared_call_id_lines(native: bool, monkeypatch: pytest.MonkeyPatch) -
         }
         for index, user in enumerate(("x", "y"))
     ]
-    outcomes: Final = await asyncio.gather(*(_success_outcome(logger, kwargs) for kwargs in shared))
+    _ = await asyncio.gather(*(_line(line, kwargs, "success") for kwargs in shared))
     text: Final = _masked(generate_latest(_ours()).decode())
     _clear_registry()
-    return sorted([*text.splitlines(), *outcomes])
+    return sorted(text.splitlines())
 
 
 async def test_concurrent_attempts_sharing_a_call_id_keep_their_own_series(monkeypatch: pytest.MonkeyPatch) -> None:
-    python_lines: Final = await _shared_call_id_lines(False, monkeypatch)
-    native_lines: Final = await _shared_call_id_lines(True, monkeypatch)
+    python_lines: Final = await _shared_call_id_lines("python", monkeypatch)
+    native_lines: Final = await _shared_call_id_lines("native", monkeypatch)
 
     assert any(
         'team="team-y"' in line and line.startswith("litellm_remaining_team_budget_metric") for line in python_lines
@@ -607,16 +667,16 @@ async def test_concurrent_attempts_sharing_a_call_id_keep_their_own_series(monke
     assert native_lines == python_lines
 
 
-async def _openmetrics(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
-    _ = await _drive(native, monkeypatch)
+async def _openmetrics(mode: Mode, monkeypatch: pytest.MonkeyPatch) -> str:
+    _ = await _drive(mode, monkeypatch)
     text: Final = _masked(generate_openmetrics(_ours()).decode())
     _clear_registry()
     return text
 
 
 async def test_openmetrics_output_matches_too(monkeypatch: pytest.MonkeyPatch) -> None:
-    python_text: Final = await _openmetrics(False, monkeypatch)
-    assert await _openmetrics(True, monkeypatch) == python_text
+    python_text: Final = await _openmetrics("python", monkeypatch)
+    assert await _openmetrics("native", monkeypatch) == python_text
 
 
 def test_a_counter_handle_keeps_the_prometheus_client_errors() -> None:

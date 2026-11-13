@@ -1286,6 +1286,7 @@ class PrometheusLogger(CustomLogger):
 
             if self._native_store is not None:
                 self._native_store.attach(self)
+                self.v2_companion = native_store.companion(self, self._native_store)
 
         except Exception as e:
             print_verbose(f"Got exception on init prometheus client {e}")
@@ -1797,6 +1798,8 @@ class PrometheusLogger(CustomLogger):
             "prometheus Logging - Enters success logging function (kwargs keys: %s)",
             list(kwargs.keys()) if isinstance(kwargs, dict) else type(kwargs).__name__,
         )
+        if self._native_store is not None:
+            native_store.disarm()
 
         # unpack kwargs
         standard_logging_payload: Final[StandardLoggingPayload | None] = kwargs.get("standard_logging_object")
@@ -1872,46 +1875,73 @@ class PrometheusLogger(CustomLogger):
             user_api_key = hash_token(user_api_key)
 
         label_context: Final = PrometheusLabelFactoryContext(enum_values)  # amortized per request.
-        native_attempt: Final = None if self._native_store is None else self._native_store.attempt(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
+
+        if self._native_store is not None and native_store.companion_in_line(self, litellm._async_success_callback):
+            native_store.arm(
+                self.v2_companion,
+                kwargs,
+                "success",
+                after=partial(
+                    self._async_set_router_remaining_metrics,
+                    standard_logging_payload=standard_logging_payload,
+                    enum_values=enum_values,
+                    label_context=label_context,
+                ),
+                budget=partial(
+                    self._increment_remaining_budget_metrics,
+                    user_api_team=user_api_team,
+                    user_api_team_alias=user_api_team_alias,
+                    user_api_key=user_api_key,
+                    user_api_key_alias=user_api_key_alias,
+                    litellm_params=litellm_params,
+                    response_cost=response_cost,
+                    user_id=user_id,
+                    user_api_key_org_id=user_api_key_org_id,
+                    end_user_id=end_user_id,
+                ),
+                input_sequence_length=(
+                    partial(self._get_input_sequence_length, standard_logging_payload, kwargs, response_obj)
+                    if self._emit_input_sequence_length_label
+                    else None
+                ),
+            )
+            return
 
         # increment total LLM requests and spend metric
-        if native_attempt is not None:
-            native_store.record(native_attempt, "success_head")
-        else:
-            self._increment_top_level_request_and_spend_metrics(
-                end_user_id=end_user_id,
-                user_api_key=user_api_key,
-                user_api_key_alias=user_api_key_alias,
-                model=model,
-                user_api_team=user_api_team,
-                user_api_team_alias=user_api_team_alias,
-                user_id=user_id,
-                response_cost=response_cost,
-                enum_values=enum_values,
-                label_context=label_context,
-            )
-            self._increment_zero_cost_requests_metric(
-                zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
-                enum_values=enum_values,
-                label_context=label_context,
-            )
+        self._increment_top_level_request_and_spend_metrics(
+            end_user_id=end_user_id,
+            user_api_key=user_api_key,
+            user_api_key_alias=user_api_key_alias,
+            model=model,
+            user_api_team=user_api_team,
+            user_api_team_alias=user_api_team_alias,
+            user_id=user_id,
+            response_cost=response_cost,
+            enum_values=enum_values,
+            label_context=label_context,
+        )
+        self._increment_zero_cost_requests_metric(
+            zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
+            enum_values=enum_values,
+            label_context=label_context,
+        )
 
-            # input, output, total token metrics
-            self._increment_token_metrics(
-                # why type ignore below?
-                # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
-                # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
-                standard_logging_payload=standard_logging_payload,
-                end_user_id=end_user_id,
-                user_api_key=user_api_key,
-                user_api_key_alias=user_api_key_alias,
-                model=model,
-                user_api_team=user_api_team,
-                user_api_team_alias=user_api_team_alias,
-                user_id=user_id,
-                enum_values=enum_values,
-                label_context=label_context,
-            )
+        # input, output, total token metrics
+        self._increment_token_metrics(
+            # why type ignore below?
+            # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
+            # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
+            standard_logging_payload=standard_logging_payload,
+            end_user_id=end_user_id,
+            user_api_key=user_api_key,
+            user_api_key_alias=user_api_key_alias,
+            model=model,
+            user_api_team=user_api_team,
+            user_api_team_alias=user_api_team_alias,
+            user_id=user_id,
+            enum_values=enum_values,
+            label_context=label_context,
+        )
 
         # remaining budget metrics
         await self._increment_remaining_budget_metrics(
@@ -1927,57 +1957,48 @@ class PrometheusLogger(CustomLogger):
         )
 
         # set proxy virtual key rpm/tpm metrics
-        if native_attempt is not None:
-            native_store.record(native_attempt, "success_limits")
-            native_store.record(
-                native_attempt,
-                "success_latency",
-                self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
+        self._set_virtual_key_rate_limit_metrics(
+            user_api_key=user_api_key,
+            user_api_key_alias=user_api_key_alias,
+            kwargs=kwargs,
+            metadata=_metadata,
+            model_id=enum_values.model_id,
+        )
+
+        self._set_v3_rate_limit_allowed_and_used_metrics(
+            standard_logging_payload=standard_logging_payload,  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
+            enum_values=enum_values,
+        )
+
+        # set latency metrics
+        self._set_latency_metrics(
+            kwargs=kwargs,
+            model=model,
+            user_api_key=user_api_key,
+            user_api_key_alias=user_api_key_alias,
+            user_api_team=user_api_team,
+            user_api_team_alias=user_api_team_alias,
+            # why type ignore below?
+            # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
+            # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
+            enum_values=enum_values,
+            label_context=label_context,
+            input_sequence_length=(
+                self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
                 if self._emit_input_sequence_length_label
-                else None,
-            )
-        else:
-            self._set_virtual_key_rate_limit_metrics(
-                user_api_key=user_api_key,
-                user_api_key_alias=user_api_key_alias,
-                kwargs=kwargs,
-                metadata=_metadata,
-                model_id=enum_values.model_id,
-            )
-            self._set_v3_rate_limit_allowed_and_used_metrics(
-                standard_logging_payload=standard_logging_payload,  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
-                enum_values=enum_values,
-            )
+                else None
+            ),
+        )
 
-            # set latency metrics
-            self._set_latency_metrics(
-                kwargs=kwargs,
-                model=model,
-                user_api_key=user_api_key,
-                user_api_key_alias=user_api_key_alias,
-                user_api_team=user_api_team,
-                user_api_team_alias=user_api_team_alias,
-                # why type ignore below?
-                # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
-                # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
-                enum_values=enum_values,
-                label_context=label_context,
-                input_sequence_length=(
-                    self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
-                    if self._emit_input_sequence_length_label
-                    else None
-                ),
-            )
-
-            # set x-ratelimit headers
-            self.set_llm_deployment_success_metrics(
-                kwargs,
-                start_time,
-                end_time,
-                enum_values,
-                output_tokens,
-                label_context=label_context,
-            )
+        # set x-ratelimit headers
+        self.set_llm_deployment_success_metrics(
+            kwargs,
+            start_time,
+            end_time,
+            enum_values,
+            output_tokens,
+            label_context=label_context,
+        )
 
         # Provider-agnostic fallback: providers like Bedrock and Vertex don't return
         # x-ratelimit-remaining-* headers, so the gauges above only fire for OpenAI /
@@ -1989,10 +2010,6 @@ class PrometheusLogger(CustomLogger):
             enum_values=enum_values,
             label_context=label_context,
         )
-
-        if native_attempt is not None:
-            native_store.record(native_attempt, "success_tail")
-            return
 
         # cache metrics
         self._increment_cache_metrics(
@@ -2949,6 +2966,8 @@ class PrometheusLogger(CustomLogger):
             "prometheus Logging - Enters failure logging function (kwargs keys: %s)",
             list(kwargs.keys()) if isinstance(kwargs, dict) else type(kwargs).__name__,
         )
+        if self._native_store is not None:
+            native_store.disarm()
 
         standard_logging_payload: Final[StandardLoggingPayload] = kwargs.get("standard_logging_object", {})
 
@@ -2967,6 +2986,7 @@ class PrometheusLogger(CustomLogger):
         user_api_team: Final = standard_logging_payload["metadata"]["user_api_key_team_id"]
         user_api_team_alias: Final = standard_logging_payload["metadata"]["user_api_key_team_alias"]
         user_api_key_org_id: Final = standard_logging_payload["metadata"].get("user_api_key_org_id")
+
         try:
             enum_values: Final = UserAPIKeyLabelValues(
                 end_user=end_user_id,
@@ -2985,45 +3005,65 @@ class PrometheusLogger(CustomLogger):
                     )
                 ),
             )
-            if self._native_store is not None:
-                native_store.record(self._native_store.attempt(kwargs), "failure")  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
-            else:
-                PrometheusLogger._inc_labeled_counter(
-                    self,
-                    self.litellm_llm_api_failed_requests_metric,
-                    "litellm_llm_api_failed_requests_metric",
-                    enum_values,
+            if self._native_store is not None and native_store.companion_in_line(self, litellm._async_failure_callback):
+                native_store.arm(
+                    self.v2_companion,
+                    kwargs,
+                    "failure",
+                    after=partial(
+                        self._set_failure_deployment_and_org_metrics,
+                        kwargs,
+                        standard_logging_payload,
+                        litellm_params,
+                        user_api_key_org_id,
+                    ),
                 )
-                self._increment_zero_cost_requests_metric(
-                    zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
-                    enum_values=enum_values,
-                    label_context=PrometheusLabelFactoryContext(enum_values),
-                )
-            self.set_llm_deployment_failure_metrics(kwargs)
-            failure_metadata: Final = _REQUEST_METADATA_ADAPTER.validate_python(
-                get_litellm_metadata_from_kwargs(kwargs)
+                return
+            PrometheusLogger._inc_labeled_counter(
+                self,
+                self.litellm_llm_api_failed_requests_metric,
+                "litellm_llm_api_failed_requests_metric",
+                enum_values,
             )
-            failure_org_alias: Final = failure_metadata.get("user_api_key_org_alias")
-            failure_org: Final = OrgBudgetSnapshot.from_metadata(failure_metadata)
-            failure_cost: Final = _response_cost_of(_LOGGED_FIELDS.validate_python(standard_logging_payload))
-            failure_committed: Final = await _committed_spend_without_own_charge(
-                counter_keys=_budgeted_org_counter(user_api_key_org_id, failure_org),
-                at_auth=committed_budget_spend_of_row(
-                    failure_metadata, _REQUEST_METADATA_ADAPTER.validate_python(litellm_params)
-                )
-                or CommittedBudgetSpend(),
-                response_cost=failure_cost,
-                read_timeout=_get_budget_metrics_per_request_timeout(),
+            self._increment_zero_cost_requests_metric(
+                zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
+                enum_values=enum_values,
+                label_context=PrometheusLabelFactoryContext(enum_values),
             )
-            await self._set_org_budget_metrics_after_api_request(
-                org_id=user_api_key_org_id,
-                response_cost=failure_cost,
-                carried=failure_org,
-                org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
-                committed_spend=failure_committed.org,
+            await self._set_failure_deployment_and_org_metrics(
+                kwargs, standard_logging_payload, litellm_params, user_api_key_org_id
             )
         except Exception as e:
             verbose_logger.exception("prometheus Layer Error(): Exception occured - %s", e)
+
+    async def _set_failure_deployment_and_org_metrics(
+        self,
+        kwargs: dict,  # pyright: ignore[reportMissingTypeArgument, reportUnknownParameterType]  # the legacy logging kwargs are untyped  # mutable-ok: the legacy helpers below take the logging kwargs dict
+        standard_logging_payload: StandardLoggingPayload,
+        litellm_params: dict,  # pyright: ignore[reportMissingTypeArgument, reportUnknownParameterType]  # the legacy logging params are untyped  # mutable-ok: read only, as before
+        user_api_key_org_id: str | None,
+    ) -> None:
+        self.set_llm_deployment_failure_metrics(kwargs)
+        failure_metadata: Final = _REQUEST_METADATA_ADAPTER.validate_python(get_litellm_metadata_from_kwargs(kwargs))
+        failure_org_alias: Final = failure_metadata.get("user_api_key_org_alias")
+        failure_org: Final = OrgBudgetSnapshot.from_metadata(failure_metadata)
+        failure_cost: Final = _response_cost_of(_LOGGED_FIELDS.validate_python(standard_logging_payload))
+        failure_committed: Final = await _committed_spend_without_own_charge(
+            counter_keys=_budgeted_org_counter(user_api_key_org_id, failure_org),
+            at_auth=committed_budget_spend_of_row(
+                failure_metadata, _REQUEST_METADATA_ADAPTER.validate_python(litellm_params)
+            )
+            or CommittedBudgetSpend(),
+            response_cost=failure_cost,
+            read_timeout=_get_budget_metrics_per_request_timeout(),
+        )
+        await self._set_org_budget_metrics_after_api_request(
+            org_id=user_api_key_org_id,
+            response_cost=failure_cost,
+            carried=failure_org,
+            org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
+            committed_spend=failure_committed.org,
+        )
 
     def _extract_status_code(
         self,

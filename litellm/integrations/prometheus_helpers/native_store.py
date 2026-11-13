@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import traceback
+import weakref
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from itertools import count
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar, get_args
 
 from prometheus_client import REGISTRY
@@ -14,10 +19,13 @@ from prometheus_client.registry import Collector
 from prometheus_client.utils import (
     floatToGoString,  # pyright: ignore[reportUnknownVariableType]  # the client ships no annotations
 )
-from pydantic import ConfigDict, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.integrations.custom_logger_v2.call import CallContext
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.native import NativeLogger, native_logger
 from litellm.integrations.prometheus_helpers import get_cached_end_user_id_for_cost_tracking
 from litellm.litellm_core_utils.core_helpers import (
     env_flag,
@@ -33,6 +41,7 @@ if TYPE_CHECKING:
 _Parsed: Final = TypeVar("_Parsed")
 PrometheusKind: TypeAlias = Literal["counter", "gauge", "histogram"]
 NativeStep: TypeAlias = Literal["success_head", "success_limits", "success_latency", "success_tail", "failure"]
+NativeEvent: TypeAlias = Literal["success", "failure"]
 NativeOp: TypeAlias = Literal[
     "deployment_state",
     "deployment_failure",
@@ -254,16 +263,6 @@ def _deployment(call: Mapping[str, object], litellm_params: Mapping[str, object]
     }
 
 
-def record(
-    attempt: _native.NativePrometheusAttempt, step: NativeStep, input_sequence_length: str | None = None
-) -> None:
-    logs, error = attempt.record(step, input_sequence_length)
-    for level, message, args in logs:
-        (verbose_logger.debug if level == "debug" else verbose_logger.error)(message, *args)
-    if error is not None:
-        raise error
-
-
 def _labelnames(kwargs: Mapping[str, object]) -> tuple[str, ...]:
     labelnames: Final = _items(kwargs.get("labelnames") or ())
     return () if labelnames is None else tuple(str(name) for name in labelnames)
@@ -394,9 +393,6 @@ class NativeStore:
             if hasattr(PrometheusMetricLabels, metric):
                 self.store.declare_labels(metric, list(logger.get_labels_for_metric(metric)))
 
-    def attempt(self, kwargs: Mapping[str, object]) -> _native.NativePrometheusAttempt:
-        return self.store.attempt(json.dumps(attempt_facts(kwargs)))
-
     def op(self, name: NativeOp, facts: Mapping[str, object]) -> None:
         self.store.op(
             name, json.dumps({**{key: json_safe(value) for key, value in facts.items()}, "settings": _settings()})
@@ -412,3 +408,193 @@ class NativeStore:
             ttl_seconds,
             litellm.prometheus_end_user_metrics_cleanup_interval_seconds,
         )
+
+
+_ATTEMPT_READS: Final = frozenset({Field.deprecated_kwargs})
+_STOP_ERRORS: Final[Mapping[str, type[Exception]]] = {
+    "value": ValueError,
+    "key": KeyError,
+    "type": TypeError,
+    "runtime": RuntimeError,
+}
+_FIRST_STEP: Final[Mapping[NativeEvent, NativeStep]] = {"success": "success_head", "failure": "failure"}
+_COMPANIONS: Final = count()
+
+
+class NativeStop(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    step: NativeStep
+    kind: Literal["value", "key", "type", "runtime", "carried"]
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class Stopped:
+    step: NativeStep
+    error: Exception
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class NativeTicket:
+    companion: NativeLogger
+    call_id: object
+    event: NativeEvent
+    wire: Mapping[str, object]
+    after: Callable[[], Awaitable[object]]
+    budget: Callable[[], Awaitable[object]] | None
+    carried: Exception | None
+    claims: Iterator[int] = field(default_factory=count)
+
+    def claim(self, companion: NativeLogger, kwargs: object) -> bool:
+        return (
+            companion is self.companion
+            and _mapping_or_empty(kwargs).get("litellm_call_id") == self.call_id
+            and next(self.claims) == 0
+        )
+
+    def stopped(self, error: RuntimeError) -> Stopped:
+        try:
+            stop: Final = NativeStop.model_validate_json(str(error))
+        except ValidationError:
+            return Stopped(step=_FIRST_STEP[self.event], error=error)
+        if stop.kind == "carried" and self.carried is not None:
+            return Stopped(step=stop.step, error=self.carried)
+        return Stopped(step=stop.step, error=_STOP_ERRORS.get(stop.kind, RuntimeError)(stop.message))
+
+
+_TICKET: Final[ContextVar[NativeTicket | None]] = ContextVar("prometheus_native_ticket", default=None)
+
+
+class _AttemptView:
+    __slots__ = ("deprecated_kwargs",)
+
+    def __init__(self, wire: Mapping[str, object]) -> None:
+        self.deprecated_kwargs: Final = wire
+
+
+def disarm() -> None:
+    _ = _TICKET.set(None)
+
+
+def companion_in_line(logger: PrometheusLogger, line: Sequence[object]) -> bool:
+    companion: Final = logger.v2_companion
+    return companion is not None and any(item is companion for item in line)
+
+
+def _measured(input_sequence_length: Callable[[], str | None] | None) -> tuple[str | None, Exception | None]:
+    if input_sequence_length is None:
+        return None, None
+    try:
+        return input_sequence_length(), None
+    except Exception as error:  # noqa: BLE001  # carried to the step where the legacy handler raised it
+        return None, error
+
+
+def arm(
+    companion: object,
+    kwargs: Mapping[str, object],
+    event: NativeEvent,
+    after: Callable[[], Awaitable[object]],
+    budget: Callable[[], Awaitable[object]] | None = None,
+    input_sequence_length: Callable[[], str | None] | None = None,
+) -> None:
+    if not isinstance(companion, NativeLogger):
+        return
+    length, carried = _measured(input_sequence_length)
+    _ = _TICKET.set(
+        NativeTicket(
+            companion=companion,
+            call_id=kwargs.get("litellm_call_id"),
+            event=event,
+            wire={
+                "event": event,
+                "facts": attempt_facts(kwargs),
+                "input_sequence_length": length,
+                "input_sequence_length_failed": carried is not None,
+            },
+            after=after,
+            budget=budget,
+            carried=carried,
+        )
+    )
+
+
+def replay_log(level: str, message: str, args: list[str]) -> None:
+    (verbose_logger.debug if level == "debug" else verbose_logger.error)(message, *args)
+
+
+def _count_callback_failure(owner: object) -> None:
+    try:
+        for callback in litellm.logging_callback_manager.get_all_callbacks():
+            increment: object = getattr(callback, "increment_callback_logging_failure", None)
+            if callable(increment):
+                _ = increment(callback_name=type(owner).__name__)
+                break
+    except Exception as e:  # noqa: BLE001  # mirrors Logging._handle_callback_failure
+        verbose_logger.debug("Error in _handle_callback_failure: %s", e)
+
+
+def _report_success_failure(owner: object, error: Exception) -> None:
+    try:
+        raise error
+    except Exception:  # noqa: BLE001  # logged with its traceback the way the legacy logging line does
+        verbose_logger.error(
+            "LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging %s", traceback.format_exc()
+        )
+    _count_callback_failure(owner)
+
+
+async def _settle_success(owner: object, ticket: NativeTicket, stopped: Stopped | None) -> None:
+    step: Final = None if stopped is None else stopped.step
+    try:
+        if step != "success_head" and ticket.budget is not None:
+            _ = await ticket.budget()
+        if step in (None, "success_tail"):
+            _ = await ticket.after()
+    except Exception as error:  # noqa: BLE001  # the legacy logging line counts and logs it the same way
+        _report_success_failure(owner, error)
+        return
+    if stopped is not None:
+        _report_success_failure(owner, stopped.error)
+
+
+async def _settle_failure(ticket: NativeTicket, stopped: Stopped | None) -> None:
+    try:
+        if stopped is not None:
+            raise stopped.error
+        _ = await ticket.after()
+    except Exception as e:  # noqa: BLE001  # the legacy failure handler logs every error this way
+        verbose_logger.exception("prometheus Layer Error(): Exception occured - %s", e)
+
+
+class PrometheusCompanion(NativeLogger):
+    def __init__(self, native: _native._NativePrometheusCallback, owner: PrometheusLogger) -> None:  # pyright: ignore[reportPrivateUsage]  # the stub's callback protocol
+        super().__init__(native)
+        self.owner: Final = weakref.ref(owner)
+        self.serial: Final = next(_COMPANIONS)
+
+    async def on_attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
+        ticket: Final = _TICKET.get()
+        if ticket is None or not ticket.claim(self, getattr(view, Field.deprecated_kwargs.value, None)):
+            return
+        stopped: Final = await self._recorded(ticket, ctx)
+        if ticket.event == "failure":
+            await _settle_failure(ticket, stopped)
+        else:
+            await _settle_success(self.owner(), ticket, stopped)
+        return
+
+    async def _recorded(self, ticket: NativeTicket, ctx: CallContext[object]) -> Stopped | None:
+        try:
+            _ = await self.run_native(Hook.attempt_ended, _ATTEMPT_READS, _AttemptView(ticket.wire), ctx)
+        except RuntimeError as error:
+            return ticket.stopped(error)
+        return None
+
+
+def companion(logger: PrometheusLogger, store: NativeStore) -> PrometheusCompanion:
+    handle: Final = store.store.callback(replay_log)
+    generated: Final = type(native_logger(handle))
+    built: Final = type(generated.__name__, (PrometheusCompanion, generated), {})
+    return built(handle, logger)

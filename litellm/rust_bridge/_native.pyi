@@ -1,5 +1,5 @@
 from asyncio import Future
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Generic, Literal, Never, NotRequired, Protocol, TypedDict, TypeVar, final
 
 import httpx
@@ -688,7 +688,6 @@ __all__ = [
     "NativeModelCostMap",
     "NativeModelCostMapState",
     "NativePending",
-    "NativePrometheusAttempt",
     "NativePrometheusMetric",
     "NativePrometheusStore",
     "NativeProvenance",
@@ -1285,6 +1284,13 @@ class RouterCall(Generic[_S]):
     # see those steps; first call: None.
     def next(self, outcome: object) -> _S: ...
 
+class _NativePrometheusCallback(Protocol):
+    def manifest(self) -> str: ...
+    def request_state(self) -> object: ...
+    def handle(
+        self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, state: object, /
+    ) -> Awaitable[object]: ...
+
 _PrometheusSeries = tuple[list[str], float, float, list[float], float]
 _PrometheusFamily = tuple[
     str, str, Literal["counter", "gauge", "histogram"], list[str], list[float], list[_PrometheusSeries]
@@ -1303,13 +1309,6 @@ class NativePrometheusMetric:
     def remove(self, *values: object) -> None: ...
     def clear(self) -> None: ...
     def collect(self) -> _PrometheusFamily: ...
-
-@final
-class NativePrometheusAttempt:
-    def __new__(cls, _uninstantiable: Never, /) -> Never: ...
-    def record(
-        self, step: str, input_sequence_length: str | None = None
-    ) -> tuple[list[tuple[Literal["debug", "error"], str, list[str]]], BaseException | None]: ...
 
 @final
 class NativePrometheusStore:
@@ -1343,4 +1342,4 @@ class NativePrometheusStore:
         cleanup_interval_seconds: float | None = None,
     ) -> None: ...
     def op(self, name: str, facts: str) -> None: ...
-    def attempt(self, facts: str) -> NativePrometheusAttempt: ...
+    def callback(self, log: Callable[[str, str, list[str]], object], /) -> _NativePrometheusCallback: ...
