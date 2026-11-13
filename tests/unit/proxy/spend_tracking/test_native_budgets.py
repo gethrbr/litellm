@@ -10,12 +10,15 @@ import pytest
 import litellm
 from litellm.caching import DualCache
 from litellm.integrations.custom_logger_v2.call import CallContext
+from litellm.integrations.custom_logger_v2.enforcement import FieldView
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
-from litellm.integrations.custom_logger_v2.outcomes import Abort
-from litellm.proxy import proxy_server
+from litellm.integrations.custom_logger_v2.legacy import PROXY_REQUEST_KEYS, KwargsFields
+from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
+from litellm.integrations.custom_logger_v2.slots import HookArgs, SlotFields
 from litellm.models.budget import LiteLLM_BudgetTable
 from litellm.models.tag import LiteLLM_TagTable
 from litellm.models.team_membership import LiteLLM_TeamMembership
+from litellm.proxy import proxy_server
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
@@ -35,6 +38,7 @@ from litellm.proxy.spend_tracking.budget_reservation import (
     reserve_budget_for_request,
 )
 from litellm.proxy.utils import ProxyLogging, hash_token
+from litellm.proxy.v2_fields import PRE_CALL_SLOTS
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
@@ -122,6 +126,7 @@ class Admitted:
     reservation: dict[str, object] | None  # mutable-ok: settlement stamps finalized on the shared reservation
     refusal: Exception | None
     counters: Mapping[str, float]
+    abort_status: int | None = None
 
 
 def _install_native_owner(store: SpendCounterStore) -> native_budgets.NativeBudgetsLogger:
@@ -145,21 +150,39 @@ async def _python_admit(store: SpendCounterStore, identity: Identity) -> Admitte
     return Admitted(reservation=reservation, refusal=None, counters=_snapshot(store))
 
 
+async def _pre_call(
+    logger: native_budgets.NativeBudgetsLogger, auth: UserAPIKeyAuth, data: dict[str, object]
+) -> Patch | Abort | None:  # mutable-ok: the request dict the proxy hands its hooks
+    fields: Final = SlotFields(
+        KwargsFields(data, PROXY_REQUEST_KEYS), PRE_CALL_SLOTS, HookArgs(auth=auth, request=data)
+    )
+    outcome: Final = await logger.run_native(
+        Hook.pre_call,
+        frozenset({Field.budget_plan}),
+        FieldView(fields),
+        CallContext[object](hook=Hook.pre_call, call=None, state=None),
+    )
+    if isinstance(outcome, Patch):
+        _ = fields.apply(outcome)
+    return outcome
+
+
 async def _native_admit(store: SpendCounterStore, identity: Identity, call_id: str) -> Admitted:
     logger: Final = _install_native_owner(store)
     _seed(store, identity)
-    plan: Final = await reserve_budget_for_request(**_arguments(identity))  # pyright: ignore[reportArgumentType]  # the shared argument table is typed per key above
-    data: Final = {**BODY, "litellm_call_id": call_id}
-    view: Final = type("View", (), {Field.deprecated_kwargs.value: data})()
-    outcome: Final = await logger.run_native(
-        Hook.pre_call,
-        frozenset({Field.deprecated_kwargs}),
-        view,
-        CallContext[object](hook=Hook.pre_call, call=None, state=None),
-    )
+    arguments: Final = _arguments(identity)
+    auth: Final = arguments["valid_token"]
+    assert isinstance(auth, UserAPIKeyAuth)
+    plan: Final = await reserve_budget_for_request(**arguments)  # pyright: ignore[reportArgumentType]  # the shared argument table is typed per key above
+    outcome: Final = await _pre_call(logger, auth, {**BODY, "litellm_call_id": call_id})
     refusal: Final = outcome.exception if isinstance(outcome, Abort) else None
     reservation: Final = plan if plan is not None and plan.get("native_call_id") is not None else None
-    return Admitted(reservation=reservation, refusal=refusal, counters=_snapshot(store))
+    return Admitted(
+        reservation=reservation,
+        refusal=refusal,
+        counters=_snapshot(store),
+        abort_status=outcome.status if isinstance(outcome, Abort) else None,
+    )
 
 
 def _refusal_fields(error: Exception | None) -> object:
@@ -486,12 +509,7 @@ async def _kind_admit(store: SpendCounterStore, kind: Kind, spend: float, native
         return Admitted(reservation=None, refusal=error, counters=_snapshot(store))
     if logger is None:
         return Admitted(reservation=reservation, refusal=None, counters=_snapshot(store))
-    outcome: Final = await logger.run_native(
-        Hook.pre_call,
-        frozenset({Field.deprecated_kwargs}),
-        type("View", (), {Field.deprecated_kwargs.value: dict(BODY)})(),
-        CallContext[object](hook=Hook.pre_call, call=None, state=None),
-    )
+    outcome: Final = await _pre_call(logger, token, dict(BODY))
     return Admitted(
         reservation=reservation if reservation is not None and "native_call_id" in reservation else None,
         refusal=outcome.exception if isinstance(outcome, Abort) else None,

@@ -14,6 +14,7 @@ const EPSILON: f64 = 1e-12;
 static ENTRY_IDS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireEntry {
     counter_key: String,
     entity_type: String,
@@ -72,6 +73,7 @@ impl Entry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Reservation {
     pub reserved_cost: f64,
     pub entries: Vec<Entry>,
@@ -428,7 +430,6 @@ mod tests {
             input_tokens: Some(12),
             throttle_counter: None,
             fail_closed: false,
-            reservation_id: None,
             status_code: 400,
         }
     }

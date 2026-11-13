@@ -428,7 +428,6 @@ async def _native_budget_plan(
             "reservation_id": new_reservation_id(),
         },
         valid_token,
-        input_tokens,
         route,
         request_body,
     )

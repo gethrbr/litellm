@@ -6,15 +6,16 @@ import uuid
 import weakref
 from collections.abc import Mapping
 from contextlib import suppress
-from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from fastapi import HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 import litellm
 from litellm.integrations.custom_logger_v2.call import CallContext
+from litellm.integrations.custom_logger_v2.derivations import write_budget_reservation
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.native import (
     NativeLogger,
@@ -23,10 +24,13 @@ from litellm.integrations.custom_logger_v2.native import (
     native_logger,
     register_abort_error,
 )
-from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
+from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch, SetField
+from litellm.integrations.custom_logger_v2.slots import HookArgs
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.proxy._types import ProxyErrorTypes, ProxyException, UserAPIKeyAuth
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.types.integrations.custom_logger_v2 import BudgetPlan, BudgetPlanCounter, BudgetReservation
+from litellm.types.proxy.native_budgets import BudgetCheck, HeldReservation, SettledReservation
 from litellm.types.utils import CallTypes
 
 if TYPE_CHECKING:
@@ -37,51 +41,65 @@ NATIVE_CALL_ID_KEY: Final = "native_call_id"
 
 
 @dataclass(slots=True)
-class _PendingPlan:
+class _PendingRequest:
+    reservation_id: str
     reservation: dict[str, object]  # mutable-ok: the shared reservation dict auth handed the request
+    auth: UserAPIKeyAuth
     identity: UserAPIKeyAuth
     request_task: asyncio.Task[object] | None
-    plan: Mapping[str, object] | None
     route: str
     request_data: Mapping[str, object]
     request: Request | None = None
 
-    def claim(self) -> Mapping[str, object] | None:
-        plan: Final = self.plan
-        self.plan = None
-        return plan
 
-
-_pending_plan: Final[ContextVar[_PendingPlan | None]] = ContextVar("native_budget_plan", default=None)
-_admitting: Final[ContextVar[Mapping[str, object] | None]] = ContextVar("native_budget_admission", default=None)
-_refusals: Final[weakref.WeakKeyDictionary[Exception, _PendingPlan]] = weakref.WeakKeyDictionary()
+_pending: Final[dict[str, _PendingRequest]] = {}  # mutable-ok: by reservation id until pre_call claims the plan
+_refusals: Final[weakref.WeakKeyDictionary[Exception, _PendingRequest]] = weakref.WeakKeyDictionary()
 
 
 def new_reservation_id() -> str:
     return uuid.uuid4().hex
 
 
+def _raw_counter(counter: object) -> object:
+    if not isinstance(counter, Mapping):
+        return counter
+    return BudgetPlanCounter.model_construct(None, **_STR_MAPPING.validate_python(counter))
+
+
+def _lenient_plan(plan: Mapping[str, object]) -> BudgetPlan:
+    try:
+        return BudgetPlan.model_validate(plan)
+    except ValidationError:
+        counters: Final = plan.get("counters")
+        members: Final[dict[str, object]] = dict(plan)  # mutable-ok: the raw members kept as Python passed them
+        if isinstance(counters, list | tuple):
+            members["counters"] = tuple(_raw_counter(counter) for counter in _OBJECTS.validate_python(counters))
+        return BudgetPlan.model_construct(None, **members)
+
+
 def pending_native_reservation(
     plan: Mapping[str, object],
     identity: UserAPIKeyAuth,
-    input_tokens: int | None,
     route: str,
     request_data: Mapping[str, object],
 ) -> dict[str, object]:  # mutable-ok: settlement stamps the reservation it returns
+    reservation_id: Final = plan.get("reservation_id")
     reservation: Final[dict[str, object]] = {  # mutable-ok: settlement stamps the reservation it returns
         "reserved_cost": 0.0,
         "entries": [],
         "finalized": False,
         "callback_bound": False,
         "input_cost": 0.0,
-        "input_tokens": input_tokens,
+        "input_tokens": None,
     }
-    _ = _pending_plan.set(
-        _PendingPlan(
+    request_task: Final = asyncio.current_task()
+    if isinstance(reservation_id, str):
+        _pending[reservation_id] = _PendingRequest(
+            reservation_id=reservation_id,
             reservation=reservation,
+            auth=identity,
             identity=identity.model_copy(),
-            request_task=asyncio.current_task(),
-            plan=plan,
+            request_task=request_task,
             route=route,
             request_data={
                 **request_data,
@@ -92,7 +110,10 @@ def pending_native_reservation(
                 },
             },
         )
-    )
+        if request_task is not None:
+            request_task.add_done_callback(lambda _: _pending.pop(reservation_id, None))
+    identity.budget_plan = _lenient_plan(plan)
+    identity.budget_reservation = reservation
     return reservation
 
 
@@ -115,9 +136,10 @@ async def await_native_admission(reservation: Mapping[str, object] | None) -> No
 _REFUSAL_TYPES: Final = (litellm.BudgetExceededError, HTTPException, ProxyException)
 
 
-def bind_native_request(reservation: Mapping[str, object] | None, request: Request) -> None:
-    pending: Final = _pending_plan.get()
-    if pending is not None and reservation is not None and pending.reservation is reservation:
+def bind_native_request(identity: UserAPIKeyAuth, request: Request) -> None:
+    plan: Final = identity.budget_plan
+    pending: Final = None if plan is None or plan.reservation_id is None else _pending.get(plan.reservation_id)
+    if pending is not None and pending.reservation is identity.budget_reservation:
         pending.request = request
 
 
@@ -152,26 +174,6 @@ _NATIVE_CALL_TYPES: Final = frozenset(
 )
 
 
-class _Entry(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    counter_key: str
-    entity_type: str
-    entity_id: str
-    reserved_cost: float
-    applied_adjustment: float
-
-
-class _Reservation(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    reserved_cost: float
-    entries: tuple[_Entry, ...]
-    finalized: bool
-    input_cost: float
-    input_tokens: int | None
-
-
 class _BudgetExceededFields(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -180,7 +182,6 @@ class _BudgetExceededFields(BaseModel):
     message: str
     entity_type: str | None
     entity_id: str | None
-    model: str | None
 
 
 class _DetailFields(BaseModel):
@@ -195,14 +196,11 @@ class _MessageFields(BaseModel):
     message: str
 
 
-class _Settled(_Reservation):
-    reseed: tuple[str, ...]
-
-
-_RESERVATION: Final = TypeAdapter(_Reservation | None)
-_HELD: Final = TypeAdapter(_Reservation)
-_SETTLED: Final = TypeAdapter(_Settled)
+_HELD: Final = TypeAdapter(HeldReservation)
+_SETTLED: Final = TypeAdapter(SettledReservation)
+_CHECK: Final[TypeAdapter[BudgetCheck]] = TypeAdapter(BudgetCheck)
 _STR_MAPPING: Final = TypeAdapter(Mapping[str, object])
+_OBJECTS: Final = TypeAdapter(tuple[object, ...])
 
 
 def native_budgets_requested() -> bool:
@@ -240,10 +238,32 @@ def _reservation_failed(wire: WireAbort) -> Exception:
     )
 
 
-def _admission(data: object) -> object:
-    request: Final = _STR_MAPPING.validate_python(data) if isinstance(data, Mapping) else {}
-    model: Final = request.get("model")
-    return {"plan": _admitting.get(), "call_id": None, "model": model if isinstance(model, str) else None}
+def _plan_members(plan: object) -> object:
+    return plan.model_dump(warnings=False) if isinstance(plan, BaseModel) else plan
+
+
+def _claim(view: object) -> _PendingRequest | None:
+    plan: Final = getattr(view, Field.budget_plan.value, None)
+    if not isinstance(plan, BudgetPlan) or plan.reservation_id is None:
+        return None
+    return _pending.pop(plan.reservation_id, None)
+
+
+def _reservation_write(outcome: Patch | Abort | None) -> object:
+    if not isinstance(outcome, Patch):
+        return None
+    return next(
+        (op.value for op in outcome.ops if isinstance(op, SetField) and op.field is Field.budget_reservation),
+        None,
+    )
+
+
+def _write_abandoned(pending: _PendingRequest, admission: _Admission) -> None:
+    if admission.cancelled() or admission.exception() is not None:
+        return
+    held: Final = _reservation_write(admission.result())
+    if held is not None:
+        write_budget_reservation(HookArgs(auth=pending.auth), held)
 
 
 class NativeBudgetsLogger(NativeLogger):
@@ -252,62 +272,47 @@ class NativeBudgetsLogger(NativeLogger):
     async def run_native(
         self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
     ) -> Patch | Abort | None:
-        pending: Final = _pending_plan.get() if hook is Hook.pre_call else None
-        plan: Final = None if pending is None else pending.claim()
-        if pending is None or plan is None:
+        pending: Final = _claim(view) if hook is Hook.pre_call else None
+        if pending is None:
             return await super().run_native(hook, reads, view, ctx)
         key: Final = id(pending.reservation)
-        admission: Final = asyncio.ensure_future(self._admit(pending, plan, hook, reads, view, ctx))
+        admission: Final = asyncio.ensure_future(self._admit(pending, hook, reads, view, ctx))
         _admissions[key] = admission
         admission.add_done_callback(lambda _: _admissions.pop(key, None))
-        return await asyncio.shield(admission)
+        try:
+            return await asyncio.shield(admission)
+        except asyncio.CancelledError:
+            admission.add_done_callback(partial(_write_abandoned, pending))
+            raise
 
     async def _admit(
         self,
-        pending: _PendingPlan,
-        plan: Mapping[str, object],
+        pending: _PendingRequest,
         hook: Hook,
         reads: frozenset[Field],
         view: object,
         ctx: CallContext[object],
     ) -> Patch | Abort | None:
-        _ = _admitting.set(plan)
         outcome: Final = await super().run_native(hook, reads, view, ctx)
-        await self._mirror(pending, plan)
+        held: Final = _reservation_write(outcome)
+        if held is not None:
+            self._hold(pending, BudgetReservation.model_validate(held))
         if isinstance(outcome, Abort) and outcome.exception is not None:
             _refusals[outcome.exception] = pending
         return outcome
 
-    async def _mirror(self, pending: _PendingPlan, plan: Mapping[str, object]) -> None:
-        reservation: Final = pending.reservation
-        reservation_id: Final = plan.get("reservation_id")
-        held: Final = (
-            _RESERVATION.validate_python(await self.budgets.take(reservation_id))
-            if isinstance(reservation_id, str)
-            else None
-        )
-        if held is None:
-            reservation.update({"entries": [], "input_tokens": None})
-            return
-        reservation.update(
-            {
-                "reserved_cost": held.reserved_cost,
-                "entries": [entry.model_dump() for entry in held.entries],
-                "input_cost": held.input_cost,
-                "input_tokens": held.input_tokens,
-                NATIVE_CALL_ID_KEY: reservation_id,
-            }
-        )
+    def _hold(self, pending: _PendingRequest, held: BudgetReservation) -> None:
+        pending.reservation[NATIVE_CALL_ID_KEY] = pending.reservation_id
         from litellm.proxy.spend_tracking.budget_reservation import start_reservation_lease_renewal
 
         start_reservation_lease_renewal(
-            budget_reservation=reservation,
-            counter_keys=frozenset(entry.counter_key for entry in held.entries),
+            budget_reservation=pending.reservation,
+            counter_keys=frozenset(entry.counter_key for entry in held.entries or () if entry.counter_key is not None),
             request_task=pending.request_task,
         )
 
 
-_PROJECTIONS: Final[Mapping[Field, Projection]] = {Field.deprecated_kwargs: _admission}
+_PROJECTIONS: Final[Mapping[Field, Projection]] = {Field.budget_plan: _plan_members}
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +364,7 @@ async def settle_native_reservation(
     if budgets is None or NATIVE_CALL_ID_KEY not in reservation:
         return
     held: Final = _HELD.validate_python(reservation)
-    settled: Final = _SETTLED.validate_python(await budgets.settle(held.model_dump(), actual_cost, finalize))
+    settled: Final = _SETTLED.validate_python(await budgets.settle(held, actual_cost, finalize))
     from litellm.proxy.spend_tracking.budget_reservation import reseed_reserved_counter
 
     for counter_key in settled.reseed:
@@ -409,4 +414,4 @@ def native_budget_decision(check: Mapping[str, object]) -> BudgetDecision | None
         return None
     from litellm.rust_bridge._native import budget_check_decision
 
-    return BudgetDecision.model_validate(budget_check_decision(check))
+    return BudgetDecision.model_validate(budget_check_decision(_CHECK.validate_python(check)))

@@ -4349,6 +4349,7 @@ async def _reserve_budget_after_common_checks(
     request: Request | None = None,
 ) -> None:
     user_api_key_auth_obj.budget_reservation = None
+    user_api_key_auth_obj.budget_plan = None
     if not skip_budget_checks and general_settings.get("disable_budget_reservation") is not True:
         from litellm.proxy.spend_tracking.budget_reservation import (
             reserve_budget_for_request,
@@ -4376,7 +4377,7 @@ async def _reserve_budget_after_common_checks(
             path_params=reservation_path_params,
         )
         if request is not None:
-            bind_native_request(user_api_key_auth_obj.budget_reservation, request)
+            bind_native_request(user_api_key_auth_obj, request)
     if request is not None:
         reservation: Final = user_api_key_auth_obj.budget_reservation
         request.state.budget_reservation = reservation  # rebind-ok: read by the release middleware

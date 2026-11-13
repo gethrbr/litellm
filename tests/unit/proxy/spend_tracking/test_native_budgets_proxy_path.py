@@ -543,25 +543,32 @@ def test_a_reservation_refusal_reaches_the_client_like_the_auth_refusal(
 
 
 @dataclass(frozen=True, slots=True)
-class _GatedTake:
-    budgets: object
+class _GatedHandle:
+    native: object
     entered: asyncio.Event
     opened: asyncio.Event
 
-    async def take(self, reservation_id: str) -> object:
+    def manifest(self) -> str:
+        manifest: Final = getattr(self.native, "manifest")
+        return manifest()
+
+    async def handle(self, *arguments: object) -> object:
+        handle: Final = getattr(self.native, "handle")
+        returned: Final = await handle(*arguments)
         self.entered.set()
         _ = await self.opened.wait()
-        take: Final = getattr(self.budgets, "take")
-        return await take(reservation_id)
+        return returned
 
 
 async def _cancel_during_pre_call(proxy: Proxy, native: bool, monkeypatch: pytest.MonkeyPatch) -> Mapping[str, float]:
     _use_native(proxy, native)
     auth: Final = await _authenticate(proxy, max_budget=1.0)
     data: Final = {**BODY, "litellm_call_id": f"call-cancel-{native}"}
-    gate: Final = _GatedTake(native_budgets.native_budgets(), asyncio.Event(), asyncio.Event())
+    gate: Final = _GatedHandle(
+        getattr(litellm.callbacks[0], "native", None) if native else None, asyncio.Event(), asyncio.Event()
+    )
     if native:
-        monkeypatch.setattr(type(litellm.callbacks[0]), "budgets", gate)
+        monkeypatch.setattr(litellm.callbacks[0], "native", gate)
     pre_call: Final = asyncio.ensure_future(
         proxy.logging.pre_call_hook(user_api_key_dict=auth, data=data, call_type="completion")
     )

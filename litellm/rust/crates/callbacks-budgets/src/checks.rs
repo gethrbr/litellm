@@ -129,7 +129,7 @@ fn py_str(value: Option<&str>) -> &str {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "check", rename_all = "snake_case")]
+#[serde(tag = "check", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Check {
     KeyMax {
         spend: PyNumber,
