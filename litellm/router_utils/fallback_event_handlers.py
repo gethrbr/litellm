@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from functools import partial, reduce
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast  # noqa: TID251  # the router passes the request kwargs as an untyped dict
 
 import httpx
 from pydantic import TypeAdapter
@@ -41,6 +41,7 @@ from litellm.router_utils.cooldown_handlers import (
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
 )
+from litellm.types.integrations.custom_logger_v2 import Outcome
 from litellm.types.router import (
     FallbackSkipReason,
     LiteLLMParamsTypedDict,
@@ -984,7 +985,14 @@ async def log_success_fallback_event(
     kwargs: dict,  # mutable-ok: the request kwargs the custom loggers receive
     original_exception: Exception,
 ):
-    await _log_fallback_event(True, original_model_group, kwargs, original_exception)
+    await _log_fallback_event(
+        True,
+        original_model_group,
+        cast(  # cast-ok: the request kwargs dict, keyed by parameter name
+            dict[str, object], kwargs
+        ),
+        original_exception,
+    )
 
 
 async def log_failure_fallback_event(
@@ -992,7 +1000,14 @@ async def log_failure_fallback_event(
     kwargs: dict,  # mutable-ok: the request kwargs the custom loggers receive
     original_exception: Exception,
 ):
-    await _log_fallback_event(False, original_model_group, kwargs, original_exception)
+    await _log_fallback_event(
+        False,
+        original_model_group,
+        cast(  # cast-ok: the request kwargs dict, keyed by parameter name
+            dict[str, object], kwargs
+        ),
+        original_exception,
+    )
 
 
 async def _log_fallback_event(
@@ -1007,7 +1022,7 @@ async def _log_fallback_event(
             Field.deprecated_kwargs: kwargs,
             Field.model: original_model_group,
             Field.error: original_exception,
-            Field.outcome: "fallback_success" if succeeded else "fallback_failure",
+            Field.outcome: Outcome.fallback_success if succeeded else Outcome.fallback_failure,
         }
     )
     subscribers: Final = hook_subscribers(Hook.router_event, callbacks, admit=Admit.every_logger)
